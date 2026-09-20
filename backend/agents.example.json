@@ -1,0 +1,20 @@
+{
+  "admin": {
+    "name": "System Administrator",
+    "sipUser": "admin@sip.vobiz.ai",
+    "pipedriveUserId": 1001,
+    "pipedriveEmail": "admin@yourcompany.pipedrive.com"
+  },
+  "john": {
+    "name": "John Doe",
+    "sipUser": "johndoe@sip.vobiz.ai",
+    "pipedriveUserId": 1002,
+    "pipedriveEmail": "john.doe@yourcompany.com"
+  },
+  "jane": {
+    "name": "Jane Smith",
+    "sipUser": "janesmith@sip.vobiz.ai",
+    "pipedriveUserId": 1003,
+    "pipedriveEmail": "jane.smith@yourcompany.com"
+  }
+}

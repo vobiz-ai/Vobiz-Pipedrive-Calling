@@ -1,0 +1,38 @@
+{
+  "name": "vobiz-pipedrive-integration",
+  "version": "1.0.0",
+  "description": "VoBiz Voice & SIP Platform integration with Pipedrive CRM for inbound calling, outbound calling, CDR synchronization, and secure recording playback",
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js",
+    "tunnel": "node backend/tunnel.js",
+    "test:outbound": "node backend/test-pipedrive-sync.js --mock-outbound",
+    "test:inbound": "node backend/test-pipedrive-sync.js --mock-inbound",
+    "test:recording": "node backend/test-pipedrive-sync.js --recording-proxy",
+    "test:sync": "node backend/test-pipedrive-sync.js --sync-cdrs",
+    "fetch-cdr": "node backend/fetch-cdr.js --sync",
+    "test": "node backend/test-pipedrive-sync.js",
+    "oauth:status": "node -e \"process.loadEnvFile('./backend/.env');fetch(process.env.TUNNEL_URL+'/auth/pipedrive/status').then(r=>r.json()).then(d=>console.log(d))\""
+  },
+  "keywords": [
+    "vobiz",
+    "pipedrive",
+    "crm",
+    "sip",
+    "voip",
+    "telephony",
+    "cdr",
+    "call-recording",
+    "webrtc"
+  ],
+  "author": "Vobiz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vobiz-ai/Vobiz-Pipedrive-Calling.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vobiz-ai/Vobiz-Pipedrive-Calling/issues"
+  },
+  "homepage": "https://github.com/vobiz-ai/Vobiz-Pipedrive-Calling#readme"
+}
