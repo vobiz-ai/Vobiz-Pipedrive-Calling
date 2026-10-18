@@ -55,6 +55,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const loginStatusEl = document.getElementById("vobiz-login-status");
   const logoutBtn = document.getElementById("logoutBtn");
+  const agentProfilesList = document.getElementById("agentProfiles");
+  const pipedriveConnectionRow = document.getElementById("pipedrive-connection");
+  const pipedriveConnectionStatus = document.getElementById("pipedrive-connection-status");
+  const pipedriveDisconnectBtn = document.getElementById("pipedriveDisconnectBtn");
 
   // Step 2 & 3: Caller ID & Dialer
   const numberSelect = document.getElementById("vobiz-number-select");
@@ -93,6 +97,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const SIP_CREDS_KEY = "vobiz_pipedrive_sip_creds";
   const SESSION_KEY = "vobiz_pipedrive_session";
   const SIP_CLAIM_KEY = "vobiz_pipedrive_sip_claim";
+  const AGENT_PROFILE_KEY = "vobiz_pipedrive_agent_profile";
+  const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 
   let authMode = "account"; // "account" | "sip"
 
@@ -192,6 +198,10 @@ document.addEventListener("DOMContentLoaded", () => {
     if (modeAccountPanel) modeAccountPanel.hidden = isSip;
     if (modeSipPanel) modeSipPanel.hidden = !isSip;
     if (stepCallerId) stepCallerId.hidden = isSip;
+    if (pipedriveConnectionRow) {
+      if (isSip) pipedriveConnectionRow.classList.add("hidden");
+      else refreshPipedriveConnection();
+    }
 
     if (modeAccountTab) {
       modeAccountTab.classList.toggle("is-active", !isSip);
@@ -465,12 +475,18 @@ document.addEventListener("DOMContentLoaded", () => {
   async function vobizAccountLogin() {
     const authId = authIdInput ? authIdInput.value.trim() : "";
     const authToken = authTokenInput ? authTokenInput.value.trim() : "";
-    const agentId = agentSelect ? agentSelect.value : "admin";
+    const agentId = agentSelect ? agentSelect.value.trim() : "";
 
     if (!authId || !authToken) {
       setLoginStatus("Enter both Vobiz Auth ID and Auth Token.");
       return;
     }
+    if (!AGENT_ID_RE.test(agentId)) {
+      setLoginStatus("Pick an agent profile, or type a new profile id (letters, digits, - and _).");
+      if (agentSelect) agentSelect.focus();
+      return;
+    }
+    try { localStorage.setItem(AGENT_PROFILE_KEY, agentId); } catch { /* storage unavailable */ }
 
     if (authId.includes("@")) {
       setLoginStatus("You entered an email address. Auth ID is an API identifier (e.g. MA_XXXXXXXX or SA_XXXXXXXX), not your console email. Switch to the 'SIP direct' tab to log in with an endpoint, or find your Auth ID in Console > API credentials.");
@@ -518,6 +534,7 @@ document.addEventListener("DOMContentLoaded", () => {
         });
 
         loadCallRecordings();
+        refreshPipedriveConnection();
       } else {
         setLoginStatus(`Login failed: ${data.error || "Check credentials"}`);
         setStatus("Login failed", "error");
@@ -623,6 +640,7 @@ document.addEventListener("DOMContentLoaded", () => {
     sipRegistered = false;
     if (window.VobizSip) window.VobizSip.disconnect();
     if (logoutBtn) logoutBtn.classList.add("hidden");
+    if (pipedriveConnectionRow) pipedriveConnectionRow.classList.add("hidden");
     setLoginStatus("Not signed in.");
     setStatus("Offline", "error");
     updateDialButtonState();
@@ -632,6 +650,86 @@ document.addEventListener("DOMContentLoaded", () => {
   if (accountLoginBtn) accountLoginBtn.addEventListener("click", vobizAccountLogin);
   if (sipConnectBtn) sipConnectBtn.addEventListener("click", sipDirectConnect);
   if (logoutBtn) logoutBtn.addEventListener("click", handleLogout);
+
+  // ─── Agent profiles (from the backend's agents.json) ──────────────────────
+  async function loadAgentProfiles() {
+    let saved = "";
+    try { saved = localStorage.getItem(AGENT_PROFILE_KEY) || ""; } catch { /* storage unavailable */ }
+    let profiles = [];
+    try {
+      const res = await fetch("/api/agents");
+      const data = await res.json();
+      profiles = Array.isArray(data.agents) ? data.agents : [];
+    } catch (err) {
+      log(`Could not load agent profiles: ${err.message}`, "warning");
+    }
+    if (agentProfilesList) {
+      agentProfilesList.innerHTML = "";
+      profiles.forEach((p) => {
+        if (!p || !AGENT_ID_RE.test(String(p.id))) return;
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        if (p.name && p.name !== p.id) opt.label = p.name;
+        opt.textContent = p.name && p.name !== p.id ? p.name : p.id;
+        agentProfilesList.appendChild(opt);
+      });
+    }
+    if (agentSelect && !agentSelect.value) {
+      if (AGENT_ID_RE.test(saved)) agentSelect.value = saved;
+      else if (profiles.length === 1) agentSelect.value = profiles[0].id;
+    }
+  }
+
+  // ─── Pipedrive connection (account mode) ──────────────────────────────────
+  async function refreshPipedriveConnection() {
+    if (!pipedriveConnectionRow) return;
+    const headers = authHeaders();
+    if (authMode !== "account" || !headers.Authorization) {
+      pipedriveConnectionRow.classList.add("hidden");
+      return;
+    }
+    try {
+      const res = await fetch("/auth/pipedrive/status");
+      const data = await res.json();
+      pipedriveConnectionRow.classList.toggle("hidden", !data.connected);
+      if (pipedriveConnectionStatus && data.connected) {
+        pipedriveConnectionStatus.textContent = data.apiDomain
+          ? `Pipedrive connected (${data.apiDomain.replace(/^https?:\/\//, "")}).`
+          : "Pipedrive connected.";
+      }
+    } catch {
+      pipedriveConnectionRow.classList.add("hidden");
+    }
+  }
+
+  async function disconnectPipedrive() {
+    const headers = authHeaders();
+    if (!headers.Authorization) {
+      setLoginStatus("Sign in with your Vobiz account to disconnect Pipedrive.");
+      return;
+    }
+    const ok = window.confirm(
+      "Disconnect Pipedrive?\n\nCalls stop being logged to Pipedrive until someone connects it again at /auth/pipedrive. This affects everyone using this backend."
+    );
+    if (!ok) return;
+    if (pipedriveDisconnectBtn) pipedriveDisconnectBtn.disabled = true;
+    try {
+      const res = await fetch("/auth/pipedrive/disconnect", { method: "POST", headers });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        log("Disconnected from Pipedrive.", "info");
+        if (pipedriveConnectionRow) pipedriveConnectionRow.classList.add("hidden");
+      } else {
+        log(`Pipedrive disconnect failed: ${data.error || `HTTP ${res.status}`}`, "error");
+      }
+    } catch (err) {
+      log(`Pipedrive disconnect failed: ${err.message}`, "error");
+    } finally {
+      if (pipedriveDisconnectBtn) pipedriveDisconnectBtn.disabled = false;
+    }
+  }
+
+  if (pipedriveDisconnectBtn) pipedriveDisconnectBtn.addEventListener("click", disconnectPipedrive);
 
   // Restore saved sessions / auth modes on load
   function restoreSession() {
@@ -663,6 +761,7 @@ document.addEventListener("DOMContentLoaded", () => {
             audioElement: remoteAudio
           });
           loadCallRecordings();
+          refreshPipedriveConnection();
           return;
         }
       } catch (e) { /* ignore */ }
@@ -997,6 +1096,7 @@ document.addEventListener("DOMContentLoaded", () => {
   if (refreshHistoryBtn) refreshHistoryBtn.addEventListener("click", loadCallRecordings);
 
   // Initialize
+  loadAgentProfiles();
   restoreSession();
 });
 

@@ -5,17 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Vobiz Calling for Pipedrive</title>
   <!--
-    The Pipedrive panel is the softphone. This page used to be a separate
-    dialer that placed calls over POST /start-call — REST origination plus
-    <Dial><User> to bridge the agent, which Vobiz blocks, from an endpoint
-    anyone could call without signing in. It had no SIP stack, so the agent
-    could never hear the call. Point the Pipedrive app extension at this URL
-    (or at /agent-phone/index.html directly).
+    The softphone is not embedded in Pipedrive: this page does not initialise
+    the Pipedrive App Extensions SDK, so it cannot run inside a Pipedrive
+    panel. It opens the softphone (/agent-phone/index.html) in its own tab.
+    Opened directly (not inside a frame), it simply goes there.
   -->
-  <meta http-equiv="refresh" content="0; url=../agent-phone/index.html">
-  <script>location.replace("../agent-phone/index.html" + location.search + location.hash);</script>
+  <script>
+    if (window.top === window.self) {
+      location.replace("../agent-phone/index.html" + location.search + location.hash);
+    }
+  </script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; color: #1f2933; background: #fff; }
+    a.open { display: inline-block; padding: 8px 14px; border-radius: 6px; background: #1f6feb; color: #fff; text-decoration: none; }
+  </style>
 </head>
 <body>
-  <p><a href="../agent-phone/index.html">Open the Vobiz softphone</a></p>
+  <p>Vobiz Calling opens the softphone in its own browser tab.</p>
+  <p><a class="open" href="../agent-phone/index.html" target="_blank" rel="noopener">Open the Vobiz softphone in a new tab</a></p>
 </body>
 </html>

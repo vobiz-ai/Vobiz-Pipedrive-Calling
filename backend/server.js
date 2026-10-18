@@ -45,7 +45,6 @@ const PORT = cleanEnvVar(process.env.PORT) || "8092";
 const VOBIZ_API_URL = cleanEnvVar(process.env.VOBIZ_API_URL) || "https://api.vobiz.ai";
 
 const PIPEDRIVE_API_TOKEN = cleanEnvVar(process.env.PIPEDRIVE_API_TOKEN);
-const PIPEDRIVE_COMPANY_DOMAIN = cleanEnvVar(process.env.PIPEDRIVE_COMPANY_DOMAIN) || "yourcompany";
 const PIPEDRIVE_API_URL = cleanEnvVar(process.env.PIPEDRIVE_API_URL) || "https://api.pipedrive.com/v1";
 
 const crypto = require("crypto");
@@ -259,23 +258,44 @@ const PIPEDRIVE_ALLOW_API_TOKEN = /^(1|true|yes)$/i.test(cleanEnvVar(process.env
 
 const ALLOW_MOCK = /^(1|true|yes)$/i.test(cleanEnvVar(process.env.ALLOW_MOCK));
 
-const AGENTS_FILE = path.join(__dirname, "agents.json");
+// Agent profiles: backend/agents.json (see agents.example.json), or the file
+// AGENTS_FILE names. Read on each use so edits apply without a restart.
+const AGENTS_FILE = cleanEnvVar(process.env.AGENTS_FILE) || path.join(__dirname, "agents.json");
+const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 
-function getAgent(agentId) {
+function loadAgents() {
   try {
     if (fs.existsSync(AGENTS_FILE)) {
       const agents = JSON.parse(fs.readFileSync(AGENTS_FILE, "utf8"));
-      return agents[agentId] || agents["admin"] || null;
+      if (agents && typeof agents === "object" && !Array.isArray(agents)) return agents;
     }
   } catch (err) {
     console.error("[backend] Error reading agents.json:", err.message);
   }
+  return {};
+}
+
+/**
+ * The profile for an agent id. An id with no entry in agents.json is still a
+ * valid profile: it is named after itself and owns nothing in Pipedrive.
+ */
+function getAgent(agentId) {
+  const entry = loadAgents()[agentId];
+  const a = entry && typeof entry === "object" ? entry : {};
+  const uid = Number(a.pipedriveUserId);
   return {
-    name: "System Administrator",
-    sipUser: "admin@sip.vobiz.ai",
-    pipedriveUserId: 1001,
-    pipedriveEmail: "admin@yourcompany.pipedrive.com"
+    id: agentId,
+    name: typeof a.name === "string" && a.name.trim() ? a.name.trim() : agentId,
+    pipedriveEmail: typeof a.pipedriveEmail === "string" ? a.pipedriveEmail : "",
+    pipedriveUserId: Number.isInteger(uid) && uid > 0 ? uid : null,
   };
+}
+
+/** Ids and display names only: this list is served without sign-in. */
+function listAgentProfiles() {
+  return Object.keys(loadAgents())
+    .filter((id) => AGENT_ID_RE.test(id))
+    .map((id) => ({ id, name: getAgent(id).name }));
 }
 
 // Global active call tracking map: request_uuid / call_id -> call details
@@ -509,6 +529,25 @@ async function pipedriveRequest(apiPath, options = {}) {
   throw err;
 }
 
+/**
+ * The person's open deal, when there is exactly one. With none or several
+ * there is no way to tell which deal the call is about, so it is not linked.
+ */
+async function openDealFor(personId) {
+  if (!personId) return { deal_id: null };
+  try {
+    const res = await pipedriveRequest(`/persons/${encodeURIComponent(personId)}/deals?status=open&limit=2`);
+    const json = await res.json().catch(() => ({}));
+    const deals = res.ok && json.success && Array.isArray(json.data) ? json.data : [];
+    if (deals.length === 1 && deals[0] && deals[0].id) {
+      return { deal_id: deals[0].id, deal_title: deals[0].title || null };
+    }
+  } catch (err) {
+    console.error("[Pipedrive] Error looking up the person's open deals:", err.message);
+  }
+  return { deal_id: null };
+}
+
 async function getPipedrivePersonByPhone(phoneNumber) {
   if (!pipedriveAvailable()) {
     // Mock data is opt-in. It used to be the silent fallback whenever the token
@@ -543,7 +582,7 @@ async function getPipedrivePersonByPhone(phoneNumber) {
         email: match.email,
         phone: match.phone,
         organization: match.org_name || null,
-        deal_id: null
+        ...(await openDealFor(match.id))
       };
     }
 
@@ -559,7 +598,7 @@ async function getPipedrivePersonByPhone(phoneNumber) {
         email: item.emails?.[0] || null,
         phone: item.phones?.[0] || null,
         organization: item.organization?.name || null,
-        deal_id: null
+        ...(await openDealFor(item.id))
       };
     }
   } catch (err) {
@@ -628,7 +667,10 @@ ${proxyRecordingUrl ? `<p><b>Recording:</b> <a href="${e(proxyRecordingUrl)}" ta
       duration: pipedriveActivityDuration(callInfo.duration),
       note: noteHtml,
       person_id: callInfo.personId || undefined,
-      deal_id: callInfo.dealId || undefined
+      deal_id: callInfo.dealId || undefined,
+      // The agent's Pipedrive user, from agents.json. Absent: the connected
+      // (authorising) user owns it, as before.
+      user_id: callInfo.pipedriveUserId || undefined
     };
 
     const res = await pipedriveRequest("/activities", {
@@ -677,6 +719,7 @@ function buildCallLogBody(callInfo, recordingLink) {
     duration: String(durationSec),
     person_id: callInfo.personId || undefined,
     deal_id: callInfo.dealId || undefined,
+    user_id: callInfo.pipedriveUserId || undefined,
     note: recordingLink ? `<p>Recording: <a href="${escapeHtml(recordingLink)}">Listen</a></p>` : undefined,
   };
 }
@@ -784,6 +827,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Agent profiles for the sign-in picker: ids and display names from
+  // agents.json, nothing else (no emails, SIP users or Pipedrive ids), so it
+  // needs no session.
+  if (pathname === "/api/agents" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ agents: listAgentProfiles() }));
+    return;
+  }
+
   // ── Pipedrive OAuth 2.0 ───────────────────────────────────────────────────
   // Required for Marketplace listing: Pipedrive mandates OAuth 2.0 and forbids
   // collecting or storing API tokens.
@@ -876,7 +928,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const authId = String(body.authId || "").trim();
       const authToken = String(body.authToken || "").trim();
-      const agentId = typeof body.agentId === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(body.agentId) ? body.agentId : "admin";
+      const agentId = typeof body.agentId === "string" && AGENT_ID_RE.test(body.agentId.trim()) ? body.agentId.trim() : "admin";
 
       if (!authId || !authToken) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -1213,6 +1265,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const agent = getAgent(agentId);
+      const ownerKnown = !sipDirect && (fromBrowser || sipTargets.length === 1);
       if (callUuid) {
         activeCalls.set(callUuid, {
           ...(activeCalls.get(callUuid) || {}),
@@ -1227,7 +1280,10 @@ const server = http.createServer(async (req, res) => {
           targetNumber: fromBrowser ? to : from,
           agentId,
           agentName: agent.name,
-          pipedriveUserId: agent.pipedriveUserId,
+          // Owner of the Activity and Call Log: only when it is known who
+          // takes the call. An outbound call is the signed-in agent's; an
+          // inbound one is only when a single signed-in agent rings.
+          pipedriveUserId: ownerKnown ? agent.pipedriveUserId : null,
           startTime: Date.now(),
         });
       }
