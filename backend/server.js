@@ -2,20 +2,23 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
+const { resolveStaticFile, contentTypeFor } = require("./static-files");
 
-// Load environment variables from .env file
+// Load environment variables from backend/.env, or from VOBIZ_ENV_FILE when set
+// (the test suite points this at a throwaway file so it never reads real
+// credentials). Variables already in the environment win.
+const ENV_FILE = process.env.VOBIZ_ENV_FILE || path.join(__dirname, ".env");
 try {
-  process.loadEnvFile(path.join(__dirname, ".env"));
+  if (fs.existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
 } catch (e) {
-  const envPath = path.join(__dirname, ".env");
-  if (fs.existsSync(envPath)) {
-    const lines = fs.readFileSync(envPath, "utf8").split("\n");
+  if (fs.existsSync(ENV_FILE)) {
+    const lines = fs.readFileSync(ENV_FILE, "utf8").split("\n");
     for (const line of lines) {
       const idx = line.indexOf("=");
       if (idx !== -1 && !line.trim().startsWith("#")) {
         const key = line.slice(0, idx).trim();
         const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
-        if (key) process.env[key] = val;
+        if (key && process.env[key] === undefined) process.env[key] = val;
       }
     }
   }
@@ -99,6 +102,55 @@ function isAllowedMediaHost(rawUrl) {
   return MEDIA_HOST_ALLOWLIST.some((re) => re.test(u.hostname));
 }
 
+/**
+ * Download a recording's audio by ID with the server's own credentials.
+ *
+ * Credentials come from the server's config only — never from the query string
+ * or request headers — so a caller cannot supply someone else's or steer where
+ * ours are sent. The media URL comes from the Vobiz API and must be on the
+ * host allowlist, before the request and after every redirect; auth headers
+ * are dropped on redirects, because a presigned URL carries its own.
+ *
+ * Returns { buffer, contentType } or { status, error }.
+ */
+async function fetchRecordingMedia(recordingId) {
+  if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN) {
+    return { status: 500, error: "Vobiz credentials are not configured on this server" };
+  }
+  const authHeaders = { "X-Auth-ID": VOBIZ_AUTH_ID, "X-Auth-Token": VOBIZ_AUTH_TOKEN, Accept: "application/json" };
+  const metaRes = await fetch(
+    `${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Recording/${encodeURIComponent(recordingId)}/`,
+    { headers: authHeaders }
+  );
+  if (!metaRes.ok) return { status: metaRes.status === 404 ? 404 : 502, error: `Vobiz returned ${metaRes.status} for that recording` };
+  const meta = await metaRes.json().catch(() => ({}));
+  const mediaUrl = meta.recording_url || meta.url;
+  if (!mediaUrl) return { status: 404, error: "No audio is available for that recording yet" };
+  if (!isAllowedMediaHost(mediaUrl)) {
+    console.error(`[recording] refusing off-allowlist media host: ${mediaUrl}`);
+    return { status: 502, error: "Recording is hosted somewhere this server will not fetch from" };
+  }
+
+  let mediaRes = await fetch(mediaUrl, { headers: authHeaders, redirect: "manual" });
+  let hops = 0;
+  while (mediaRes.status >= 300 && mediaRes.status < 400 && hops < 3) {
+    const location = mediaRes.headers.get("location");
+    if (!location) break;
+    const next = new URL(location, mediaUrl).toString();
+    if (!isAllowedMediaHost(next)) {
+      console.error(`[recording] refusing redirect to ${next}`);
+      return { status: 502, error: "Recording redirected somewhere this server will not follow" };
+    }
+    mediaRes = await fetch(next, { redirect: "manual" });
+    hops++;
+  }
+  if (!mediaRes.ok) return { status: 502, error: `Media server returned ${mediaRes.status}` };
+  return {
+    contentType: mediaRes.headers.get("content-type") || "audio/mpeg",
+    buffer: Buffer.from(await mediaRes.arrayBuffer()),
+  };
+}
+
 // Opt-in mocking. Without this, an unconfigured server reports failure rather
 // than inventing CRM records that look real.
 const pipedriveOAuth = require("./pipedrive-oauth");
@@ -129,6 +181,66 @@ function getSession(req) {
   if (!s) return null;
   if (Date.now() - s.createdAt > SESSION_TTL_MS) { sessions.delete(token); return null; }
   return s;
+}
+
+function safeEqual(a, b) {
+  const x = crypto.createHash("sha256").update(String(a)).digest();
+  const y = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(x, y) && String(a) === String(b);
+}
+
+/**
+ * Gate for every route that spends money, reads CRM data, or reads call
+ * recordings. Writes a 401 and returns null when there is no valid session.
+ */
+function requireSession(req, res) {
+  const s = getSession(req);
+  if (!s) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Sign in first" }));
+    return null;
+  }
+  return s;
+}
+
+/** The account's DIDs, read with the server's own credentials. */
+async function fetchAccountNumbers() {
+  let numbers = [];
+  if (VOBIZ_AUTH_ID && VOBIZ_AUTH_TOKEN) {
+    try {
+      const r = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${encodeURIComponent(VOBIZ_AUTH_ID)}/numbers?per_page=100`, {
+        headers: { "X-Auth-ID": VOBIZ_AUTH_ID, "X-Auth-Token": VOBIZ_AUTH_TOKEN, Accept: "application/json" },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const raw = data.items || data.numbers || data.objects || (Array.isArray(data) ? data : []);
+        numbers = raw.map((n) => (typeof n === "string" ? n : (n.e164 || n.number || n.phone_number || n.alias))).filter(Boolean);
+      } else {
+        console.warn(`[numbers] Vobiz returned ${r.status} listing numbers`);
+      }
+    } catch (e) {
+      console.warn("[numbers] could not list account numbers:", e.message);
+    }
+  }
+  numbers = Array.from(new Set(numbers));
+  if (numbers.length === 0 && VOBIZ_FROM_NUMBER) numbers = [VOBIZ_FROM_NUMBER];
+  return numbers;
+}
+
+const { makeVerifier } = require("./vobiz-signature");
+const verifyVobizWebhook = makeVerifier({
+  mode: cleanEnvVar(process.env.VOBIZ_WEBHOOK_SIGNATURES) || "verify",
+  authToken: VOBIZ_AUTH_TOKEN,
+  publicBaseUrl: () => getPublicBaseUrl() || "",
+});
+
+/** Writes a 403 and returns false when a Vobiz webhook fails verification. */
+function rejectUnverifiedWebhook(req, res, pathname) {
+  if (verifyVobizWebhook(req, pathname)) return false;
+  res.writeHead(403, { "Content-Type": "text/plain" });
+  res.end("invalid signature");
+  return true;
 }
 
 const PIPEDRIVE_ALLOW_API_TOKEN = /^(1|true|yes)$/i.test(cleanEnvVar(process.env.PIPEDRIVE_ALLOW_API_TOKEN));
@@ -171,8 +283,6 @@ function getAgent(agentId) {
 const activeCalls = new Map();
 // Cache of completed call recordings and CDRs
 const callRecordings = new Map();
-// SIP username -> caller ID the agent picked (for SIP direct mode)
-const fromBySipUser = new Map();
 
 /**
  * The answer URL, for both directions.
@@ -336,6 +446,25 @@ function formatDuration(seconds) {
   return `${pad(mins)}:${pad(secs)}`;
 }
 
+/**
+ * Pipedrive activity `duration` is HH:MM. Sending MM:SS — what this used to
+ * do — logged a 42-second call as 42 minutes. Rounded up so a short call is
+ * never shown as zero.
+ */
+function pipedriveActivityDuration(seconds) {
+  const sec = Math.max(0, parseInt(seconds || 0, 10) || 0);
+  const totalMinutes = Math.ceil(sec / 60);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(Math.floor(totalMinutes / 60))}:${pad(totalMinutes % 60)}`;
+}
+
+/** "YYYY-MM-DD HH:MM:SS" in UTC, the format /callLogs requires. */
+function pipedriveUtc(ms) {
+  return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+}
+
+const escapeHtml = (v) => escapeXmlAttr(v).replace(/'/g, "&#39;");
+
 // ==========================================
 // Pipedrive API Integration Helpers
 // ==========================================
@@ -479,32 +608,30 @@ async function createPipedriveActivity(callInfo) {
       : null;
 
     const formattedDuration = formatDuration(callInfo.duration);
-    
-    // HTML Formatted Note for Pipedrive Activity
+
+    // Every value here can come from a webhook, so all of it is escaped
+    // before it goes into HTML that Pipedrive renders.
+    const e = escapeHtml;
     const noteHtml = `
-<h3>📞 VoBiz Telephony Call Log</h3>
+<h3>Vobiz call log</h3>
 <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: sans-serif; font-size: 13px;">
-  <tr style="background-color: #f4f5f7;"><th>Parameter</th><th>Value</th></tr>
-  <tr><td><b>Call UUID</b></td><td><code>${callInfo.callUuid || "N/A"}</code></td></tr>
-  <tr><td><b>Direction</b></td><td>${callInfo.direction}</td></tr>
-  <tr><td><b>From</b></td><td>${callInfo.from}</td></tr>
-  <tr><td><b>To</b></td><td>${callInfo.to}</td></tr>
-  <tr><td><b>Agent</b></td><td>${callInfo.agentName || "System Administrator"}</td></tr>
-  <tr><td><b>Duration</b></td><td>${formattedDuration} (${callInfo.duration || 0}s)</td></tr>
-  <tr><td><b>Hangup Cause</b></td><td><code>${callInfo.hangupCause || "NORMAL_CLEARING"}</code></td></tr>
-  <tr><td><b>Status</b></td><td><span style="color: green; font-weight: bold;">COMPLETED</span></td></tr>
-  <tr><td><b>Timestamp</b></td><td>${new Date().toISOString()}</td></tr>
+  <tr><td><b>Call UUID</b></td><td><code>${e(callInfo.callUuid || "N/A")}</code></td></tr>
+  <tr><td><b>Direction</b></td><td>${e(callInfo.direction)}</td></tr>
+  <tr><td><b>From</b></td><td>${e(callInfo.from)}</td></tr>
+  <tr><td><b>To</b></td><td>${e(callInfo.to)}</td></tr>
+  <tr><td><b>Agent</b></td><td>${e(callInfo.agentName || "")}</td></tr>
+  <tr><td><b>Duration</b></td><td>${e(formattedDuration)} (${e(callInfo.duration || 0)}s)</td></tr>
+  <tr><td><b>Hangup cause</b></td><td><code>${e(callInfo.hangupCause || "")}</code></td></tr>
 </table>
-${proxyRecordingUrl ? `<p style="margin-top:12px;">▶️ <b>Call Recording:</b> <a href="${proxyRecordingUrl}" target="_blank" style="color:#00875a; font-weight:bold;">Listen / Download Audio MP3</a></p>` : "<p><i>No call recording available for this call.</i></p>"}
+${proxyRecordingUrl ? `<p><b>Recording:</b> <a href="${e(proxyRecordingUrl)}" target="_blank" rel="noopener">Listen</a> (link expires; re-open it from the softphone's recordings list)</p>` : "<p><i>No recording for this call.</i></p>"}
 `;
 
     const body = {
-      subject: `VoBiz ${callInfo.direction} Call - ${callInfo.targetNumber}`,
+      subject: `Vobiz ${callInfo.direction} call - ${callInfo.targetNumber || ""}`.trim(),
       type: "call",
       done: 1,
-      duration: formattedDuration,
+      duration: pipedriveActivityDuration(callInfo.duration),
       note: noteHtml,
-      public_description: `VoBiz ${callInfo.direction} Call Log (${formattedDuration})`,
       person_id: callInfo.personId || undefined,
       deal_id: callInfo.dealId || undefined
     };
@@ -532,31 +659,77 @@ ${proxyRecordingUrl ? `<p style="margin-top:12px;">▶️ <b>Call Recording:</b>
   }
 }
 
+/**
+ * POST /callLogs. Pipedrive requires `outcome`, `to_phone_number`,
+ * `start_time` and `end_time`. This used to send `to_call_number`,
+ * `phone_number`, `recording_url` and no end time, so every request was
+ * rejected with a 400 that nothing checked — no Call Log was ever written.
+ * The recording link goes in the note: Pipedrive only takes recordings as a
+ * file upload to /callLogs/{id}/recordings.
+ */
+function buildCallLogBody(callInfo, recordingLink) {
+  const durationSec = Math.max(0, parseInt(callInfo.duration || 0, 10) || 0);
+  const end = callInfo.endTime || Date.now();
+  const start = callInfo.startTime || (end - durationSec * 1000);
+  const answered = durationSec > 0 || /^(completed|answer)/i.test(String(callInfo.dialStatus || ""));
+  return {
+    subject: `Vobiz ${callInfo.direction} call`,
+    outcome: answered ? "connected" : (/busy/i.test(String(callInfo.hangupCause || "")) ? "busy" : "no_answer"),
+    from_phone_number: callInfo.from || undefined,
+    to_phone_number: callInfo.to || callInfo.targetNumber,
+    start_time: pipedriveUtc(start),
+    end_time: pipedriveUtc(Math.max(end, start)),
+    duration: String(durationSec),
+    person_id: callInfo.personId || undefined,
+    deal_id: callInfo.dealId || undefined,
+    note: recordingLink ? `<p>Recording: <a href="${escapeHtml(recordingLink)}">Listen</a></p>` : undefined,
+  };
+}
+
+/**
+ * Attach the audio to the Call Log, so it plays inside Pipedrive for as long
+ * as the record exists. The signed link in the note expires (it has to: it
+ * is readable by everyone on the CRM account), so this is the durable copy.
+ */
+async function uploadCallLogRecording(callLogId, recordingId) {
+  try {
+    const media = await fetchRecordingMedia(recordingId);
+    if (media.error) {
+      console.warn(`[Pipedrive] recording ${recordingId} not attached: ${media.error}`);
+      return { success: false, error: media.error };
+    }
+    const ext = /wav/i.test(media.contentType) ? "wav" : "mp3";
+    const form = new FormData();
+    form.append("file", new Blob([media.buffer], { type: media.contentType }), `${recordingId}.${ext}`);
+    const res = await pipedriveRequest(`/callLogs/${encodeURIComponent(callLogId)}/recordings`, { method: "POST", body: form });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.success) {
+      console.warn(`[Pipedrive] recording upload failed: HTTP ${res.status}`, json.error || "");
+      return { success: false, status: res.status, error: json.error || `HTTP ${res.status}` };
+    }
+    console.log(`[Pipedrive] Attached recording to Call Log ${callLogId}`);
+    return { success: true };
+  } catch (err) {
+    console.warn("[Pipedrive] recording upload error:", err.message);
+    return { success: false, error: err.message };
+  }
+}
+
 async function createPipedriveCallLog(callInfo) {
   if (!pipedriveAvailable()) {
-    return { success: true, mock: true };
+    return { success: false, pipedriveConfigured: false, error: "Pipedrive is not configured on this server" };
   }
 
   try {
     const publicBaseUrl = getPublicBaseUrl() || `http://localhost:${PORT}`;
-    // Signed, expiring, and keyed by recording ID — never the media URL, and
-    // never carrying credentials. This link is written into a CRM note, where
-    // everyone on the account can read it for as long as the record exists.
     const proxyRecordingUrl = callInfo.recordingId
       ? signRecordingUrl(callInfo.recordingId, publicBaseUrl)
       : null;
 
-    const body = {
-      to_call_number: callInfo.to,
-      phone_number: callInfo.from,
-      outcome: "connected",
-      duration: String(callInfo.duration || 0),
-      person_id: callInfo.personId || undefined,
-      deal_id: callInfo.dealId || undefined,
-      has_recording: !!proxyRecordingUrl,
-      recording_url: proxyRecordingUrl || undefined,
-      start_time: new Date().toISOString().slice(0, 19).replace("T", " ")
-    };
+    const body = buildCallLogBody(callInfo, proxyRecordingUrl);
+    if (!body.to_phone_number) {
+      return { success: false, error: "No destination number for this call; call log not written" };
+    }
 
     const res = await pipedriveRequest("/callLogs", {
       method: "POST",
@@ -567,13 +740,19 @@ async function createPipedriveCallLog(callInfo) {
       body: JSON.stringify(body)
     });
 
-    const json = await res.json();
-    if (json.success) {
-      console.log(`[Pipedrive] Successfully created CallLog entry ID #${json.data?.id}`);
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.success) {
+      console.error("[Pipedrive] Call Log creation failed:", res.status, json.error || json);
+      return { success: false, status: res.status, error: json.error || `HTTP ${res.status}` };
+    }
+    const callLogId = json.data && json.data.id;
+    console.log(`[Pipedrive] Created Call Log ${callLogId}`);
+    if (callLogId && callInfo.recordingId) {
+      json.recordingUpload = await uploadCallLogRecording(callLogId, callInfo.recordingId);
     }
     return json;
   } catch (err) {
-    console.error("[Pipedrive] CallLog creation notice:", err.message);
+    console.error("[Pipedrive] Call Log creation error:", err.message);
     return { success: false, error: err.message };
   }
 }
@@ -599,18 +778,19 @@ const server = http.createServer(async (req, res) => {
   // 1. Health check
   if (pathname === "/health" || pathname === "/api/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
+    // Booleans only. This used to print the first characters of the Auth ID
+    // and the Pipedrive token to anyone who asked.
     res.end(JSON.stringify({
       status: "ok",
       service: "vobiz-pipedrive-integration",
-      vobizAuthId: VOBIZ_AUTH_ID ? `${VOBIZ_AUTH_ID.substring(0, 6)}...` : "NOT_SET",
-      pipedriveToken: PIPEDRIVE_API_TOKEN ? `${PIPEDRIVE_API_TOKEN.substring(0, 6)}...` : "NOT_SET",
-      publicTunnelUrl: getPublicBaseUrl() || "NOT_CONNECTED",
-      timestamp: new Date().toISOString()
+      vobizConfigured: Boolean(VOBIZ_AUTH_ID && VOBIZ_AUTH_TOKEN),
+      sipConfigured: Boolean(VOBIZ_SIP_USER && VOBIZ_SIP_PASSWORD),
+      pipedriveConnected: pipedriveAvailable(),
+      publicUrlConfigured: Boolean(getPublicBaseUrl()),
     }));
     return;
   }
 
-  // 1b. Login Authentication Endpoint
   // ── Pipedrive OAuth 2.0 ───────────────────────────────────────────────────
   // Required for Marketplace listing: Pipedrive mandates OAuth 2.0 and forbids
   // collecting or storing API tokens.
@@ -620,6 +800,14 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         error: "Pipedrive OAuth is not configured. Set PIPEDRIVE_CLIENT_ID, PIPEDRIVE_CLIENT_SECRET and PIPEDRIVE_REDIRECT_URI.",
       }));
+      return;
+    }
+    // Once connected, re-authorising needs a signed-in agent to disconnect
+    // first. Otherwise anyone who can reach this URL could swap in their own
+    // Pipedrive company and receive this account's call logs.
+    if (pipedriveOAuth.isConnected()) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Already connected to Pipedrive. Sign in to the softphone and disconnect first to connect a different company." }));
       return;
     }
     const target = pipedriveOAuth.buildAuthorizeUrl(PIPEDRIVE_OAUTH_ENV);
@@ -685,162 +873,79 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Sign-in. The agent proves they hold THIS server's Vobiz Auth ID and Auth
+  // Token and gets an opaque session token back.
+  //
+  // This used to ask Vobiz whether the pair was valid and then treat a 307, or
+  // any response at all when the Auth ID merely matched the server's, as
+  // success — so the Auth ID alone (it is printed in /health and on every
+  // screenshot) signed you in, and the session then handed out the SIP
+  // password. A valid pair for some *other* Vobiz account was also accepted,
+  // though every call is billed to this one. The comparison is now local,
+  // exact and constant-time, and there is no mock bypass.
   if ((pathname === "/api/login" || pathname === "/login") && req.method === "POST") {
     try {
       const body = await readJsonBody(req);
-      const authId = (body.authId || "").trim();
-      const authToken = (body.authToken || "").trim();
-      const agentId = body.agentId || "admin";
+      const authId = String(body.authId || "").trim();
+      const authToken = String(body.authToken || "").trim();
+      const agentId = typeof body.agentId === "string" && body.agentId ? body.agentId : "admin";
 
       if (!authId || !authToken) {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: false, error: "Both VoBiz Auth ID and Auth Token are required." }));
+        res.end(JSON.stringify({ success: false, error: "Both Vobiz Auth ID and Auth Token are required." }));
+        return;
+      }
+      if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "VOBIZ_AUTH_ID / VOBIZ_AUTH_TOKEN are not configured on this server." }));
+        return;
+      }
+      // Evaluate both comparisons so timing does not reveal which one failed.
+      const idOk = safeEqual(authId, VOBIZ_AUTH_ID);
+      const tokenOk = safeEqual(authToken, VOBIZ_AUTH_TOKEN);
+      if (!(idOk && tokenOk)) {
+        console.log(`[/api/login] rejected sign-in attempt for ${authId.slice(0, 12)}`);
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "Invalid Vobiz Auth ID or Auth Token. Use the API credentials of the account this server is configured for (console.vobiz.ai → API credentials)." }));
         return;
       }
 
-      // Validation check & phone number lookup
-      let isValid = false;
-      let numbers = [];
-
-      try {
-        const fetchNumbers = await new Promise((resolve) => {
-          const https = require("https");
-          const authHeader = "Basic " + Buffer.from(`${authId}:${authToken}`).toString("base64");
-          const reqVal = https.request({
-            hostname: "api.vobiz.ai",
-            path: `/api/v1/Account/${encodeURIComponent(authId)}/numbers?per_page=100`,
-            method: "GET",
-            headers: {
-              "Authorization": authHeader,
-              "X-Auth-ID": authId,
-              "X-Auth-Token": authToken,
-              "Accept": "application/json"
-            },
-            timeout: 10000
-          }, (resVal) => {
-            let data = "";
-            resVal.on("data", chunk => (data += chunk));
-            resVal.on("end", () => {
-              if (resVal.statusCode >= 200 && resVal.statusCode < 300) {
-                try {
-                  const json = JSON.parse(data);
-                  const rawNumbers = json.items || json.numbers || json.objects || (Array.isArray(json) ? json : []);
-                  const parsedNumbers = rawNumbers.map(n => typeof n === "string" ? n : (n.e164 || n.number || n.phone_number || n.alias)).filter(Boolean);
-                  resolve({ ok: true, numbers: parsedNumbers });
-                } catch {
-                  resolve({ ok: true, numbers: [] });
-                }
-              } else if (resVal.statusCode === 307 || (VOBIZ_AUTH_ID && authId === VOBIZ_AUTH_ID)) {
-                resolve({ ok: true, numbers: [] });
-              } else {
-                console.log(`[/api/login] Vobiz rejected ${authId}: HTTP ${resVal.statusCode}`);
-                resolve({ ok: false, numbers: [] });
-              }
-            });
-          });
-          reqVal.on("timeout", () => {
-            reqVal.destroy();
-            console.error("[/api/login] Vobiz API request timed out");
-            resolve({ ok: false, numbers: [] });
-          });
-          reqVal.on("error", (err) => {
-            console.error("[/api/login] Could not reach Vobiz to validate:", err.message);
-            resolve({ ok: false, numbers: [] });
-          });
-          reqVal.end();
-        });
-
-        isValid = fetchNumbers.ok;
-        numbers = fetchNumbers.numbers;
-      } catch (e) {
-        console.error("[/api/login] Validation exception:", e.message);
-        isValid = false;
-      }
-
-      if (VOBIZ_AUTH_ID && authId === VOBIZ_AUTH_ID && authToken === VOBIZ_AUTH_TOKEN) {
-        isValid = true;
-      }
-
-      if (!isValid) {
-        if (ALLOW_MOCK) {
-          console.log(`[/api/login] ALLOW_MOCK is enabled — allowing testing login for: ${authId}`);
-          isValid = true;
-        } else {
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: "Invalid VoBiz Auth ID or Auth Token. Ensure you are using API credentials from console.vobiz.ai, or use the 'SIP direct' tab." }));
-          return;
-        }
-      }
-
       const agent = getAgent(agentId);
-      if (numbers.length === 0 && VOBIZ_FROM_NUMBER) numbers.push(VOBIZ_FROM_NUMBER);
-      const selectedNumber = numbers[0] || VOBIZ_FROM_NUMBER || "";
+      const numbers = await fetchAccountNumbers();
+      const selectedNumber = numbers[0] || "";
 
       // The browser gets an opaque session token, never the Auth Token back.
       const token = crypto.randomBytes(32).toString("hex");
       sessions.set(token, { agentId, authId, numbers, from: selectedNumber, createdAt: Date.now() });
 
-      console.log(`[/api/login] ${agentId} signed in as ${authId}`);
+      console.log(`[/api/login] ${agentId} signed in`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
-        message: "VoBiz authentication successful!",
+        message: "Signed in to Vobiz.",
         token,
         authId,
         numbers,
         selected: selectedNumber,
-        agent: { id: agentId, name: agent.name, email: agent.pipedriveEmail, sipUser: agent.sipUser },
+        agent: { id: agentId, name: agent.name, email: agent.pipedriveEmail },
       }));
     } catch (err) {
       console.error("[/api/login] Exception:", err.message);
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: false, error: err.message }));
+      res.end(JSON.stringify({ success: false, error: "Sign-in failed" }));
     }
     return;
   }
 
-  // SIP direct login endpoint: registers SIP endpoint credentials & outbound caller ID
-  if ((pathname === "/login-sip" || pathname === "/api/login-sip") && req.method === "POST") {
-    try {
-      const body = await readJsonBody(req);
-      const { sipUser, callerId } = body || {};
-      if (!sipUser || !callerId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: false, error: "sipUser and callerId are required" }));
-        return;
-      }
-      const cleanUser = String(sipUser).replace(/^sip:/, "").split("@")[0];
-      fromBySipUser.set(cleanUser, callerId);
-      console.log(`[/login-sip] Registered SIP direct user: ${cleanUser} -> callerId: ${callerId}`);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, success: true, sipUser: cleanUser, callerId }));
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: false, error: err.message }));
-    }
-    return;
-  }
-
-  // Session query endpoint
-  if ((pathname === "/session" || pathname === "/api/session" || pathname.startsWith("/session/")) && req.method === "GET") {
-    const targetAgentId = pathname.startsWith("/session/") ? decodeURIComponent(pathname.slice("/session/".length)) : "";
-    if (targetAgentId) {
-      for (const s of sessions.values()) {
-        if (s.agentId === targetAgentId && (Date.now() - s.createdAt <= SESSION_TTL_MS)) {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ loggedIn: true, agentId: s.agentId, authId: s.authId, numbers: s.numbers || [VOBIZ_FROM_NUMBER].filter(Boolean), from: s.from || VOBIZ_FROM_NUMBER }));
-          return;
-        }
-      }
-    }
+  // Session query endpoint. Bearer token only: the old /session/<agentId>
+  // variant told anyone who asked whether an agent was signed in, and as
+  // which Auth ID with which numbers.
+  if ((pathname === "/session" || pathname === "/api/session") && req.method === "GET") {
     const s = getSession(req);
-    if (s) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ loggedIn: true, agentId: s.agentId, authId: s.authId, numbers: s.numbers || [VOBIZ_FROM_NUMBER].filter(Boolean), from: s.from || VOBIZ_FROM_NUMBER }));
-      return;
-    }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ loggedIn: false }));
+    res.end(JSON.stringify(s
+      ? { loggedIn: true, agentId: s.agentId, authId: s.authId, numbers: s.numbers || [], from: s.from || "" }
+      : { loggedIn: false }));
     return;
   }
 
@@ -854,13 +959,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Recordings list endpoint
+  // Recent recordings, each with a signed, short-lived playback link.
+  // Behind the session: the signed links ARE the access control for the audio,
+  // so handing them to anyone who asked made the signature pointless.
   if ((pathname === "/recordings" || pathname === "/api/recordings") && req.method === "GET") {
+    if (!requireSession(req, res)) return;
     try {
       const publicBaseUrl = getPublicBaseUrl() || `http://localhost:${PORT}`;
-      const limit = Math.min(Number(parsedUrl.query.limit || 15), 50);
+      const limit = Math.min(Math.max(Number(parsedUrl.query.limit) || 15, 1), 50);
       let recordings = [];
-      if (VOBIZ_AUTH_ID && VOBIZ_AUTH_TOKEN && !VOBIZ_AUTH_ID.includes("YOUR_")) {
+      if (VOBIZ_AUTH_ID && VOBIZ_AUTH_TOKEN) {
         try {
           const r = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Recording/?limit=${limit}`, {
             headers: { "X-Auth-ID": VOBIZ_AUTH_ID, "X-Auth-Token": VOBIZ_AUTH_TOKEN, Accept: "application/json" }
@@ -868,7 +976,7 @@ const server = http.createServer(async (req, res) => {
           if (r.ok) {
             const data = await r.json();
             const objects = data.objects || data.items || [];
-            recordings = objects.map(o => ({
+            recordings = objects.filter((o) => o.recording_id).map((o) => ({
               recording_id: o.recording_id,
               add_time: o.add_time,
               rounded_recording_duration: o.rounded_recording_duration,
@@ -877,16 +985,16 @@ const server = http.createServer(async (req, res) => {
             }));
           }
         } catch (e) {
-          console.warn("[/recordings] VoBiz API fetch notice:", e.message);
+          console.warn("[/recordings] Vobiz API fetch notice:", e.message);
         }
       }
       if (recordings.length === 0 && callRecordings.size > 0) {
-        recordings = Array.from(callRecordings.values()).map(c => ({
-          recording_id: c.recordingId || c.callUuid,
-          add_time: new Date(c.startTime || Date.now()).toLocaleTimeString(),
+        recordings = Array.from(callRecordings.values()).filter((c) => c.recordingId).map((c) => ({
+          recording_id: c.recordingId,
+          add_time: new Date(c.startTime || Date.now()).toISOString(),
           rounded_recording_duration: c.duration || 0,
           call_uuid: c.callUuid,
-          playUrl: c.recordingId ? signRecordingUrl(c.recordingId, publicBaseUrl) : (c.recordingUrl || "/recording-file?url=sample"),
+          playUrl: signRecordingUrl(c.recordingId, publicBaseUrl),
         }));
       }
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -898,19 +1006,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Play recording convenience endpoint (by callUuid)
+  // Signed playback link for a call this server has seen.
   if (pathname === "/play-recording" && req.method === "GET") {
+    if (!requireSession(req, res)) return;
     const callUuid = parsedUrl.query.callUuid;
     const publicBaseUrl = getPublicBaseUrl() || `http://localhost:${PORT}`;
-    let rec = callUuid ? (callRecordings.get(callUuid) || activeCalls.get(callUuid)) : null;
+    const rec = callUuid ? (callRecordings.get(callUuid) || activeCalls.get(callUuid)) : null;
     if (rec && rec.recordingId) {
-      res.writeHead(302, { Location: signRecordingUrl(rec.recordingId, publicBaseUrl) });
-      res.end();
-      return;
-    }
-    if (rec && rec.recordingUrl) {
-      res.writeHead(302, { Location: rec.recordingUrl });
-      res.end();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ playUrl: signRecordingUrl(rec.recordingId, publicBaseUrl) }));
       return;
     }
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -924,30 +1028,15 @@ const server = http.createServer(async (req, res) => {
   // billed to this account, so they are never served to an unauthenticated
   // caller and never embedded in agents.json, which is committed.
   if (pathname === "/api/agent-sip" && req.method === "GET") {
-    const session = getSession(req);
-    if (!session) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Sign in first" }));
-      return;
-    }
+    const session = requireSession(req, res);
+    if (!session) return;
     if (!VOBIZ_SIP_USER || !VOBIZ_SIP_PASSWORD) {
-      if (ALLOW_MOCK) {
-        const agent = getAgent(session.agentId);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          displayName: agent.name,
-          sipUser: `test_agent@${VOBIZ_REGISTRAR}`,
-          sipPassword: "demo_password",
-          registrarUrl: `wss://${VOBIZ_REGISTRAR}:5063/`,
-        }));
-        return;
-      }
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "VOBIZ_SIP_USER / VOBIZ_SIP_PASSWORD are not configured on this server" }));
       return;
     }
     const agent = getAgent(session.agentId);
-    res.writeHead(200, { "Content-Type": "application/json" });
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     res.end(JSON.stringify({
       displayName: agent.name,
       sipUser: `${VOBIZ_SIP_USER}@${VOBIZ_REGISTRAR}`,
@@ -957,188 +1046,32 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 1b. Fetch Account DID Numbers
+  // The account's numbers, for the caller-ID picker.
   if ((pathname === "/numbers" || pathname === "/api/numbers") && req.method === "GET") {
-    try {
-      // Behind the session, and the credentials are the server's own. Reading
-      // them from the query string let anyone list the account's numbers, and
-      // meant the browser had to hold them to ask.
-      if (!getSession(req)) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Sign in first", numbers: [] }));
-        return;
-      }
-      const authId = VOBIZ_AUTH_ID;
-      const authToken = VOBIZ_AUTH_TOKEN;
-
-      let numbers = [];
-      if (authId && authToken) {
-        try {
-          console.log(`[Pipedrive Backend] Fetching phone numbers for Auth ID: ${authId}`);
-          const vobizUrl = `${VOBIZ_API_URL}/api/v1/Account/${authId}/numbers?per_page=1000&limit=1000`;
-          const response = await fetch(vobizUrl, {
-            method: "GET",
-            headers: {
-              "X-Auth-ID": authId,
-              "X-Auth-Token": authToken,
-              "Content-Type": "application/json"
-            }
-          });
-
-          if (response.ok) {
-            const data = await response.json();
-            let rawNumbers = data.items || data.numbers || data.objects || (Array.isArray(data) ? data : []);
-            let parsedNumbers = rawNumbers.map(n => typeof n === "string" ? n : (n.e164 || n.number || n.phone_number || n.alias)).filter(Boolean);
-            numbers = Array.from(new Set(parsedNumbers));
-          }
-        } catch (e) {
-          console.warn("[Pipedrive Backend] VoBiz numbers API warning:", e.message);
-        }
-      }
-
-      if (numbers.length === 0 && VOBIZ_FROM_NUMBER) {
-        numbers = [VOBIZ_FROM_NUMBER];
-      }
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ numbers, count: numbers.length }));
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ numbers: [VOBIZ_FROM_NUMBER].filter(Boolean), error: err.message }));
-    }
+    if (!requireSession(req, res)) return;
+    const numbers = await fetchAccountNumbers();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ numbers, count: numbers.length }));
     return;
   }
 
-  // 2. Initiate Outbound Call via VoBiz Voice API
-  if (pathname === "/start-call" && req.method === "POST") {
-    try {
-      const body = await readJsonBody(req);
-      const { to, agentId = "admin", authId: reqAuthId, authToken: reqAuthToken, fromNumber } = body;
-
-      const activeAuthId = (reqAuthId || req.headers["x-auth-id"] || VOBIZ_AUTH_ID || "").trim();
-      const activeAuthToken = (reqAuthToken || req.headers["x-auth-token"] || VOBIZ_AUTH_TOKEN || "").trim();
-
-      if (!to) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing required parameter 'to'" }));
-        return;
-      }
-
-      const agent = getAgent(agentId);
-      const publicBaseUrl = getPublicBaseUrl() || `http://localhost:${PORT}`;
-
-      const formattedTo = to.trim().startsWith("+") ? to.trim() : `+${to.trim().replace(/^0+/, "")}`;
-
-      console.log(`[Outbound Call] Agent: ${agent.name} (${agent.sipUser}) dialing target: ${formattedTo}`);
-
-      // Lookup Pipedrive Person for contact auto-matching
-      const personMatch = await getPipedrivePersonByPhone(formattedTo);
-
-      let callResult = null;
-
-      if (!activeAuthId || activeAuthId.includes("YOUR_")) {
-        console.log("[VoBiz API] Credentials not configured. Simulating VoBiz call response.");
-        callResult = {
-          message: "call placed (mock)",
-          request_uuid: `mock-uuid-${Date.now()}`,
-          api_id: `api-mock-${Date.now()}`
-        };
-      } else {
-        const answerUrl = `${publicBaseUrl}/answer?agentId=${encodeURIComponent(agentId)}&targetNumber=${encodeURIComponent(formattedTo)}`;
-        const headers = {
-          "X-Auth-ID": activeAuthId,
-          "X-Auth-Token": activeAuthToken,
-          "Content-Type": "application/json"
-        };
-        const primaryFrom = VOBIZ_FROM_NUMBER || "";
-        const effectiveFrom = (fromNumber && fromNumber.trim()) ? fromNumber.trim() : primaryFrom;
-
-        const payload = {
-          from: effectiveFrom,
-          to: formattedTo,
-          answer_url: answerUrl,
-          answer_method: "POST"
-        };
-
-        console.log(`[VoBiz API] Making POST request to ${VOBIZ_API_URL}/api/v1/Account/${activeAuthId}/Call/`);
-        console.log(`[VoBiz API] Payload:`, payload);
-
-        const vobizRes = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${activeAuthId}/Call/`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(payload)
-        });
-
-        const rawText = await vobizRes.text();
-        console.log(`[VoBiz API] Response status ${vobizRes.status}:`, rawText);
-        try {
-          callResult = JSON.parse(rawText);
-        } catch {
-          callResult = { message: rawText, request_uuid: `uuid-${Date.now()}` };
-        }
-
-        // A non-2xx from Vobiz means no call was placed. This used to log the
-        // error and carry on to return {success:true} with an invented UUID,
-        // which made a failed call indistinguishable from a successful one in
-        // the API response, the UI, and the CRM activity that followed.
-        if (!vobizRes.ok) {
-          console.error("[VoBiz API] Call REJECTED:", vobizRes.status, callResult);
-          res.writeHead(vobizRes.status === 400 ? 400 : 502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            success: false,
-            // Vobiz returns `error` as either a string or an object of field
-            // errors; String() on the latter yields "[object Object]", which
-            // tells the operator nothing.
-            error: describeVobizError(callResult, vobizRes.status),
-            vobizStatus: vobizRes.status,
-          }));
-          return;
-        }
-      }
-
-      // No invented identifiers. If Vobiz did not name the call, we do not have
-      // one to track, and pretending otherwise is what put fabricated UUIDs
-      // into the CRM.
-      const callUuid = callResult.request_uuid || callResult.call_uuid;
-      if (!callUuid) {
-        console.error("[start-call] Vobiz accepted the request but returned no call identifier:", callResult);
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: false, error: "Vobiz returned no call identifier" }));
-        return;
-      }
-      activeCalls.set(callUuid, {
-        callUuid,
-        direction: "Outbound",
-        from: VOBIZ_FROM_NUMBER,
-        to,
-        targetNumber: to,
-        agentId,
-        agentName: agent.name,
-        pipedriveUserId: agent.pipedriveUserId,
-        personId: personMatch.person_id,
-        personName: personMatch.name,
-        dealId: personMatch.deal_id,
-        startTime: Date.now()
-      });
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        success: true,
-        callUuid,
-        agent: agent.name,
-        pipedriveContact: personMatch,
-        voBizResponse: callResult
-      }));
-    } catch (err) {
-      console.error("[start-call] Exception:", err.message);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    }
+  // REST origination is gone. It dialled the customer with POST /Call/ and
+  // then bridged the agent with <Dial><User>, which Vobiz blocks (see
+  // vobizAnswerXml) — and it was unauthenticated, so anyone could place calls
+  // billed to this account. Outbound calls start in the browser: ua.call().
+  if (pathname === "/start-call" || pathname === "/transfer-call") {
+    res.writeHead(410, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      error: pathname === "/start-call"
+        ? "Outbound calls are placed from the softphone over SIP (the browser is the A leg). This endpoint was removed."
+        : "Call transfer is not supported by this integration.",
+    }));
     return;
   }
 
   // 3. Answer & Fallback Callback - Returns VoBiz XML to Dial Agent Softphone & Record Call
   if ((pathname === "/answer" || pathname === "/fallback") && (req.method === "POST" || req.method === "GET")) {
+    if (rejectUnverifiedWebhook(req, res, pathname)) return;
     try {
       const body = req.method === "POST" ? await readFormOrJsonBody(req) : {};
       const params = { ...parsedUrl.query, ...body };
@@ -1161,12 +1094,18 @@ const server = http.createServer(async (req, res) => {
       const routeType = String(params.RouteType || params.routetype || "").toLowerCase();
       const fromBrowser = from.startsWith("sip:") || routeType === "sip";
 
-      // For outbound from browser, check SIPHeader_X-VH-Caller-ID, fromBySipUser, or default account DID.
-      // For inbound, must answer with the DID that was actually dialled, or the B leg is never created.
-      const sipUser = (from.match(/^sip:([^@]+)@/) || [])[1] || VOBIZ_SIP_USER;
-      const sipHeaderCallerId = params['SIPHeader_X-VH-Caller-ID'] || params['SIPHeader_X-PH-Caller-ID'] || params['X-VH-Caller-ID'] || params['X-PH-Caller-ID'] || params.CallerID || params.caller_id;
+      // Outbound: the softphone sends the caller ID it picked as an X-VH-Caller-ID
+      // SIP header, which Vobiz passes to this URL as an X-VH- parameter. Only a
+      // phone-number shape is accepted; Vobiz itself refuses a caller ID the
+      // account does not own.
+      // Inbound: must answer with the DID that was actually dialled, or the B
+      // leg is never created.
+      const headerCallerId = String(
+        params["X-VH-Caller-ID"] || params["SIPHeader_X-VH-Caller-ID"] || params["X-PH-Caller-ID"] || ""
+      ).trim();
+      const pickedCallerId = /^\+?\d{6,15}$/.test(headerCallerId) ? toE164(headerCallerId) : "";
       const callerId = fromBrowser
-        ? (sipHeaderCallerId || fromBySipUser.get(sipUser) || VOBIZ_FROM_NUMBER)
+        ? (pickedCallerId || VOBIZ_FROM_NUMBER)
         : (toE164(to) || VOBIZ_FROM_NUMBER);
 
       const callUuid = params.CallUUID || params.call_uuid || "";
@@ -1208,6 +1147,7 @@ const server = http.createServer(async (req, res) => {
   // DialBLegUUID is the single most useful field in this stack: empty means no
   // B leg was ever created, whatever the UI said.
   if (pathname === "/dial-status") {
+    if (rejectUnverifiedWebhook(req, res, pathname)) return;
     const d = req.method === "POST" ? { ...parsedUrl.query, ...(await readFormOrJsonBody(req)) } : parsedUrl.query;
     const bleg = d.DialBLegUUID || "";
     console.log(
@@ -1232,53 +1172,71 @@ const server = http.createServer(async (req, res) => {
 
   // 4. Recording Callback from VoBiz Voice Platform
   if (pathname === "/recording-callback" && req.method === "POST") {
+    if (rejectUnverifiedWebhook(req, res, pathname)) return;
     try {
       const body = await readFormOrJsonBody(req);
       console.log("[/recording-callback] Received recording webhook:", body);
 
-      const recordUrl = body.RecordUrl || body.recording_url || body.url;
-      // The ID is what playback links are keyed on now — the raw media URL is
+      const recordUrl = body.RecordUrl || body.RecordFile || body.recording_url || null;
+      // The ID is what playback links are keyed on — the raw media URL is
       // never handed to a browser or written into a CRM note.
       const recordingId = body.RecordingID || body.RecordingId || body.recording_id || null;
-      const duration = parseInt(body.RecordDuration || body.duration || 0, 10);
-      const callUuid = body.CallUUID || body.call_uuid || body.request_uuid || `rec-${Date.now()}`;
-      const fromNumber = body.From || body.from || VOBIZ_FROM_NUMBER;
-      const toNumber = body.To || body.to || "+15550192834";
+      // Vobiz sends RecordingDuration; RecordDuration was never a field, so
+      // every activity used to be logged with a zero duration.
+      const duration = parseInt(body.RecordingDuration || body.RecordDuration || body.duration || 0, 10) || 0;
+      const callUuid = body.CallUUID || body.call_uuid || "";
+      if (!callUuid) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "CallUUID is required" }));
+        return;
+      }
+      const fromNumber = String(body.From || body.from || "");
+      const toNumber = String(body.To || body.to || "");
 
       let callInfo = activeCalls.get(callUuid);
       if (!callInfo) {
-        // Fallback for inbound or untracked calls
-        const personMatch = await getPipedrivePersonByPhone(fromNumber === VOBIZ_FROM_NUMBER ? toNumber : fromNumber);
+        // A call this process did not see answered (e.g. after a restart).
+        // Infer what we can; never invent a number.
+        const outbound = fromNumber.startsWith("sip:") || fromNumber === VOBIZ_FROM_NUMBER;
+        const target = outbound ? toNumber : fromNumber;
+        const personMatch = target ? await getPipedrivePersonByPhone(target) : {};
         callInfo = {
           callUuid,
-          direction: fromNumber === VOBIZ_FROM_NUMBER ? "Outbound" : "Inbound",
+          direction: outbound ? "Outbound" : "Inbound",
           from: fromNumber,
           to: toNumber,
-          targetNumber: fromNumber === VOBIZ_FROM_NUMBER ? toNumber : fromNumber,
-          agentName: "System Administrator",
-          pipedriveUserId: 1001,
+          targetNumber: target,
+          agentName: "",
           personId: personMatch.person_id,
           personName: personMatch.name,
           dealId: personMatch.deal_id
         };
+      } else if (!callInfo.personId && callInfo.targetNumber) {
+        const personMatch = await getPipedrivePersonByPhone(callInfo.targetNumber);
+        callInfo.personId = personMatch.person_id;
+        callInfo.personName = personMatch.name;
+        callInfo.dealId = personMatch.deal_id;
       }
 
       callInfo.recordingUrl = recordUrl;
       callInfo.recordingId = recordingId;
-      callInfo.duration = duration;
-      callInfo.hangupCause = callInfo.hangupCause || "NORMAL_CLEARING";
+      // Prefer the bridged B-leg duration from /dial-status when we have it.
+      callInfo.duration = callInfo.duration || duration;
+      callInfo.endTime = callInfo.endTime || Date.now();
 
       callRecordings.set(callUuid, callInfo);
 
-      // Create Activity and CallLog in Pipedrive
+      // Create Activity and Call Log in Pipedrive
       const activityRes = await createPipedriveActivity(callInfo);
-      await createPipedriveCallLog(callInfo);
+      const callLogRes = await createPipedriveCallLog(callInfo);
+      callInfo.crmSynced = Boolean(activityRes && activityRes.success && !activityRes.mocked);
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "recording_logged",
         callUuid,
-        pipedriveActivity: activityRes
+        pipedriveActivity: activityRes,
+        pipedriveCallLog: callLogRes
       }));
     } catch (err) {
       console.error("[/recording-callback] Error:", err.message);
@@ -1290,6 +1248,7 @@ const server = http.createServer(async (req, res) => {
 
   // 5. Hangup Callback / CDR Metadata Callback
   if (pathname === "/hangup-callback" && req.method === "POST") {
+    if (rejectUnverifiedWebhook(req, res, pathname)) return;
     try {
       const body = await readFormOrJsonBody(req);
       console.log("[/hangup-callback] Received hangup webhook:", body);
@@ -1314,79 +1273,52 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 5b. REST Hangup Call Endpoint
+  // 5b. Hang up a call by UUID over the REST API, with the server's own
+  // credentials only. It used to accept authId/authToken from the request
+  // and needed no session, so anyone could end anyone's call.
   if (pathname === "/hangup-call" && req.method === "POST") {
+    if (!requireSession(req, res)) return;
     try {
       const body = await readJsonBody(req);
-      const { callUuid, authId, authToken } = body;
-      const activeAuthId = authId || VOBIZ_AUTH_ID;
-      const activeAuthToken = authToken || VOBIZ_AUTH_TOKEN;
-
-      console.log(`[VoBiz Backend] Hanging up call UUID: ${callUuid}`);
-      if (callUuid && activeAuthId && activeAuthToken) {
-        try {
-          await fetch(`${VOBIZ_API_URL}/api/v1/Account/${activeAuthId}/Call/${callUuid}/`, {
-            method: "DELETE",
-            headers: {
-              "X-Auth-ID": activeAuthId,
-              "X-Auth-Token": activeAuthToken
-            }
-          });
-        } catch (e) {}
+      const callUuid = String(body.callUuid || "").trim();
+      if (!/^[A-Za-z0-9-]{8,64}$/.test(callUuid)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "callUuid is required" }));
+        return;
       }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, message: "Call terminated" }));
+      const r = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Call/${encodeURIComponent(callUuid)}/`, {
+        method: "DELETE",
+        headers: { "X-Auth-ID": VOBIZ_AUTH_ID, "X-Auth-Token": VOBIZ_AUTH_TOKEN },
+      });
+      const ok = r.ok || r.status === 204;
+      res.writeHead(ok ? 200 : 502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(ok ? { success: true } : { success: false, error: `Vobiz returned ${r.status}` }));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: err.message }));
     }
     return;
   }
 
-  // 5c. REST Transfer Call Endpoint
-  if (pathname === "/transfer-call" && req.method === "POST") {
-    try {
-      const body = await readJsonBody(req);
-      const { callUuid, target, authId, authToken } = body;
-      console.log(`[VoBiz Backend] Transferring call UUID: ${callUuid} to target: ${target}`);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, message: `Transfer initiated to ${target}` }));
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    }
-    return;
-  }
-
-  // 5d. Poll Recording Info Endpoint for Softphone Player
+  // 5d. Latest recording for a call, as a signed playback link. No raw media
+  // URLs, and no placeholder "sample" recording when there is none.
   if ((pathname === "/api/recording-info" || pathname === "/recording-info") && req.method === "GET") {
-    try {
-      const uuid = parsedUrl.query.uuid;
-      let rec = uuid ? callRecordings.get(uuid) : null;
-      if (!rec && callRecordings.size > 0) {
-        rec = Array.from(callRecordings.values()).pop();
-      }
-
-      if (rec && rec.recordingUrl) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          success: true,
-          callUuid: rec.callUuid,
-          recordingUrl: rec.recordingUrl,
-          duration: rec.duration || 45
-        }));
-      } else {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          success: true,
-          recordingUrl: "https://media.vobiz.ai/v1/recording/sample-audio.mp3",
-          duration: 45
-        }));
-      }
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+    if (!requireSession(req, res)) return;
+    const uuid = parsedUrl.query.uuid;
+    const rec = uuid ? callRecordings.get(uuid) : Array.from(callRecordings.values()).pop();
+    if (!rec || !rec.recordingId) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, status: "pending" }));
+      return;
     }
+    const publicBaseUrl = getPublicBaseUrl() || `http://localhost:${PORT}`;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      success: true,
+      callUuid: rec.callUuid,
+      playUrl: signRecordingUrl(rec.recordingId, publicBaseUrl),
+      duration: rec.duration || 0,
+    }));
     return;
   }
 
@@ -1417,76 +1349,14 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Credentials come from the server's own config. They are never read from
-      // the query string or from request headers, so a caller cannot supply
-      // someone else's and cannot steer where ours are sent.
-      if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Vobiz credentials are not configured on this server" }));
+      const media = await fetchRecordingMedia(recordingId);
+      if (media.error) {
+        res.writeHead(media.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: media.error }));
         return;
       }
-      const authHeaders = {
-        "X-Auth-ID": VOBIZ_AUTH_ID,
-        "X-Auth-Token": VOBIZ_AUTH_TOKEN,
-        Accept: "application/json"
-      };
-
-      const metaRes = await fetch(
-        `${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Recording/${encodeURIComponent(recordingId)}/`,
-        { headers: authHeaders }
-      );
-      if (!metaRes.ok) {
-        res.writeHead(metaRes.status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Vobiz returned ${metaRes.status} for that recording` }));
-        return;
-      }
-      const meta = await metaRes.json().catch(() => ({}));
-      const mediaUrl = meta.recording_url || meta.url;
-      if (!mediaUrl) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "No audio is available for that recording yet" }));
-        return;
-      }
-      if (!isAllowedMediaHost(mediaUrl)) {
-        console.error(`[/recording-file] refusing off-allowlist media host: ${mediaUrl}`);
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Recording is hosted somewhere this server will not fetch from" }));
-        return;
-      }
-
-      let mediaRes = await fetch(mediaUrl, { headers: authHeaders, redirect: "manual" });
-
-      // Recordings are commonly served as a redirect to presigned object
-      // storage. Follow one hop, but re-check the host — and drop the auth
-      // headers, because a presigned URL carries its own authorisation and
-      // forwarding ours to a third party is the bug this endpoint just had.
-      let hops = 0;
-      while (mediaRes.status >= 300 && mediaRes.status < 400 && hops < 3) {
-        const location = mediaRes.headers.get("location");
-        if (!location) break;
-        const next = new URL(location, mediaUrl).toString();
-        if (!isAllowedMediaHost(next)) {
-          console.error(`[/recording-file] refusing redirect to ${next}`);
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Recording redirected somewhere this server will not follow" }));
-          return;
-        }
-        mediaRes = await fetch(next, { redirect: "manual" });
-        hops++;
-      }
-
-      if (!mediaRes.ok) {
-        res.writeHead(mediaRes.status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Media server returned ${mediaRes.status}` }));
-        return;
-      }
-
-      const contentType = mediaRes.headers.get("content-type") || "audio/mpeg";
-      const headersOut = { "Content-Type": contentType, "Accept-Ranges": "bytes" };
-      const len = mediaRes.headers.get("content-length");
-      if (len) headersOut["Content-Length"] = len;
-      res.writeHead(200, headersOut);
-      res.end(Buffer.from(await mediaRes.arrayBuffer()));
+      res.writeHead(200, { "Content-Type": media.contentType, "Content-Length": media.buffer.length, "Cache-Control": "private, no-store" });
+      res.end(media.buffer);
     } catch (err) {
       console.error("[/recording-file] error:", err.message);
       res.writeHead(500, { "Content-Type": "application/json" });
@@ -1495,22 +1365,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Fetch Latest Recording Info Endpoint
-  if (pathname === "/api/recording-info") {
-    try {
-      const uuid = parsedUrl.query.uuid;
-      const callInfo = (uuid && (callRecordings.get(uuid) || activeCalls.get(uuid))) || Array.from(callRecordings.values()).pop() || null;
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(callInfo || { status: "pending" }));
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    }
-    return;
-  }
-
   // 7. Pipedrive Contact Lookup Endpoint (for Softphone UI)
   if (pathname === "/api/pipedrive/persons/lookup") {
+    if (!requireSession(req, res)) return;
     try {
       const phone = parsedUrl.query.phone;
       if (!phone) {
@@ -1529,15 +1386,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 8. Trigger Live CDR Fetch & Sync to Pipedrive
-  if (pathname === "/sync-recent-cdrs") {
+  if (pathname === "/sync-recent-cdrs" && (req.method === "POST" || req.method === "GET")) {
+    // Behind the session: this writes to the CRM.
+    if (!requireSession(req, res)) return;
     try {
-      if (!VOBIZ_AUTH_ID || VOBIZ_AUTH_ID.includes("YOUR_")) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          status: "mock_sync_completed",
-          syncedCount: 1,
-          message: "VoBiz credentials not set. Simulated sync completed."
-        }));
+      if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "not_configured", error: "VOBIZ_AUTH_ID / VOBIZ_AUTH_TOKEN are not configured on this server" }));
         return;
       }
 
@@ -1564,13 +1419,13 @@ const server = http.createServer(async (req, res) => {
           from: cdr.caller_id_number,
           to: cdr.destination_number,
           targetNumber,
-          agentName: "System Administrator",
-          pipedriveUserId: 1001,
+          agentName: "",
           personId: personMatch.person_id,
           personName: personMatch.name,
           dealId: personMatch.deal_id,
           duration: cdr.duration || 0,
-          hangupCause: cdr.hangup_cause || "NORMAL_CLEARING",
+          startTime: Date.parse(cdr.start_time) || undefined,
+          hangupCause: cdr.hangup_cause || "",
           recordingUrl: cdr.recording_url || null
         };
 
@@ -1604,34 +1459,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 9. Static File Server for Agent Softphone & Pipedrive App UI
-  let filePath = path.join(__dirname, "..", pathname);
-  if (pathname === "/") {
-    filePath = path.join(__dirname, "..", "agent-phone", "index.html");
-  } else if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
-    const agentPhonePath = path.join(__dirname, "..", "agent-phone", pathname);
-    if (fs.existsSync(agentPhonePath) && fs.statSync(agentPhonePath).isFile()) {
-      filePath = agentPhonePath;
+  // 9. Static files: the softphone and the Pipedrive panel, nothing else.
+  if (req.method === "GET" || req.method === "HEAD") {
+    const filePath = resolveStaticFile(pathname);
+    if (filePath) {
+      res.writeHead(200, { "Content-Type": contentTypeFor(filePath), "X-Content-Type-Options": "nosniff" });
+      if (req.method === "HEAD") { res.end(); return; }
+      fs.createReadStream(filePath).pipe(res);
+      return;
     }
   }
 
-  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-    const ext = path.extname(filePath).toLowerCase();
-    const mimeTypes = {
-      ".html": "text/html",
-      ".js": "text/javascript",
-      ".css": "text/css",
-      ".json": "application/json",
-      ".png": "image/png",
-      ".svg": "image/svg+xml"
-    };
-    res.writeHead(200, { "Content-Type": mimeTypes[ext] || "text/plain" });
-    fs.createReadStream(filePath).pipe(res);
-    return;
-  }
-
   res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "Endpoint or static resource not found", path: pathname }));
+  res.end(JSON.stringify({ error: "Not found" }));
 });
 
 server.listen(PORT, () => {

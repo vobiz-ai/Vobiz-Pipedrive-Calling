@@ -1,218 +1,157 @@
-// Integration Test Suite for VoBiz to Pipedrive CRM Integration
-// Usage: node backend/test-pipedrive-sync.js [--mock-outbound] [--mock-inbound] [--recording-proxy] [--sync-cdrs]
+// Live checks against a RUNNING backend (npm start) and its real services.
+// Usage: node backend/test-pipedrive-sync.js [--answer] [--inbound] [--recording-proxy] [--sync-cdrs]
+//
+// For the offline suite, which needs no credentials and no network, run
+// `npm test`.
+//
+// Every check reports PASS, FAIL or SKIP, and the process exits non-zero if
+// anything failed. SKIP is not a pass: it means a service is not configured.
+//
+// --inbound writes ONE real Activity and Call Log into the connected Pipedrive
+// company, labelled with a test call UUID. Use a sandbox. No check here places
+// a phone call.
 
-
-/*
- * Every check below reports PASS, FAIL, or SKIP — and the process exits
- * non-zero if anything failed.
- *
- * It used to print a green tick for all four suites regardless of what
- * happened: an outbound call that Vobiz rejected with HTTP 400 was reported as
- * "Outbound call initiated successfully", CRM syncs that never left the process
- * were reported as synced, and 24 bytes of a hardcoded fake MP3 header were
- * reported as streamed audio. A suite that cannot fail is not a test.
- */
 let PASSED = 0, FAILED = 0, SKIPPED = 0;
-
-function pass(name, detail) {
-  PASSED++;
-  console.log(`  PASS  ${name}${detail ? " — " + detail : ""}`);
-}
-function fail(name, detail) {
-  FAILED++;
-  console.error(`  FAIL  ${name}${detail ? " — " + detail : ""}`);
-}
-function skip(name, why) {
-  SKIPPED++;
-  console.log(`  SKIP  ${name}${why ? " — " + why : ""}`);
-}
-
-function summarise() {
-  console.log(`\n${"=".repeat(50)}`);
-  console.log(`  ${PASSED} passed, ${FAILED} failed, ${SKIPPED} skipped`);
-  if (SKIPPED) console.log("  Skipped checks are NOT passes — configure the service and re-run.");
-  console.log(`${"=".repeat(50)}\n`);
-  process.exitCode = FAILED > 0 ? 1 : 0;
-}
+const pass = (n, d) => { PASSED++; console.log(`  PASS  ${n}${d ? " — " + d : ""}`); };
+const fail = (n, d) => { FAILED++; console.error(`  FAIL  ${n}${d ? " — " + d : ""}`); };
+const skip = (n, d) => { SKIPPED++; console.log(`  SKIP  ${n}${d ? " — " + d : ""}`); };
 
 const fs = require("fs");
 const path = require("path");
-
-try {
-  process.loadEnvFile(path.join(__dirname, ".env"));
-} catch (e) {
-  const envPath = path.join(__dirname, ".env");
-  if (fs.existsSync(envPath)) {
-    const lines = fs.readFileSync(envPath, "utf8").split("\n");
-    for (const line of lines) {
-      const idx = line.indexOf("=");
-      if (idx !== -1 && !line.trim().startsWith("#")) {
-        const key = line.slice(0, idx).trim();
-        const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
-        if (key) process.env[key] = val;
-      }
-    }
-  }
-}
+const envFile = process.env.VOBIZ_ENV_FILE || path.join(__dirname, ".env");
+try { if (fs.existsSync(envFile)) process.loadEnvFile(envFile); } catch { /* Node < 20.12: use real env vars */ }
 
 const PORT = process.env.PORT || 8092;
 const BASE_URL = `http://localhost:${PORT}`;
+const FORM = { "Content-Type": "application/x-www-form-urlencoded" };
 
-async function runTests() {
+async function signIn() {
+  const r = await fetch(`${BASE_URL}/api/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ authId: process.env.VOBIZ_AUTH_ID || "", authToken: process.env.VOBIZ_AUTH_TOKEN || "" }),
+  });
+  const j = await r.json().catch(() => ({}));
+  return r.ok && j.token ? j.token : null;
+}
+
+async function main() {
   const args = process.argv.slice(2);
-  const runAll = args.length === 0;
+  const all = args.length === 0;
 
-  console.log(`\n==================================================`);
-  console.log(`🧪 Running VoBiz Pipedrive Integration Test Suite`);
-  console.log(`==================================================`);
+  console.log(`\nLive checks against ${BASE_URL}\n`);
 
-  // 1. Health Check Test
-  console.log(`\n[Test 1] Checking Backend Health...`);
+  let health;
   try {
-    const res = await fetch(`${BASE_URL}/health`);
-    const json = await res.json();
-    if (res.ok && json.status === "ok") {
-      pass("backend health", `port ${PORT}`);
-    } else {
-      console.error(`❌ Health check failed:`, json);
-    }
+    const r = await fetch(`${BASE_URL}/health`);
+    health = await r.json();
+    if (r.ok && health.status === "ok") pass("backend health");
+    else fail("backend health", JSON.stringify(health));
   } catch (err) {
-    console.error(`❌ Server is not reachable at ${BASE_URL}. Ensure 'npm start' is running! Error:`, err.message);
-    process.exit(1);
+    fail("backend reachable", `${err.message} — is 'npm start' running?`);
+    return summarise();
   }
 
-  // 2. Outbound Call Test
-  if (runAll || args.includes("--mock-outbound")) {
-    console.log(`\n[outbound] POST /start-call`);
-    try {
-      const res = await fetch(`${BASE_URL}/start-call`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to: "+15550192834", agentId: "admin" })
-      });
-      const json = await res.json().catch(() => ({}));
+  const token = await signIn();
+  if (token) pass("sign in with VOBIZ_AUTH_ID / VOBIZ_AUTH_TOKEN");
+  else fail("sign in", "the server rejected the credentials in backend/.env");
 
-      if (!res.ok || json.success === false) {
-        // This is the honest outcome when Vobiz rejects the request — which it
-        // does whenever answer_url is not a public HTTPS URL, i.e. whenever no
-        // tunnel is running. Previously this path printed a tick.
-        fail("outbound call", `HTTP ${res.status}: ${typeof json.error === "string" ? json.error : JSON.stringify(json.error) || "rejected"}`);
-      } else if (!json.callUuid) {
-        fail("outbound call", "no call identifier returned");
-      } else if (/^uuid-\d+$/.test(json.callUuid)) {
-        fail("outbound call", `fabricated identifier ${json.callUuid}`);
-      } else {
-        pass("outbound call", `call ${json.callUuid}`);
-        const contact = json.pipedriveContact || {};
-        if (contact.mocked) {
-          skip("Pipedrive person lookup", "mock mode — no CRM was contacted");
-        } else if (contact.pipedriveConfigured === false) {
-          skip("Pipedrive person lookup", "Pipedrive not connected — run /auth/pipedrive");
-        } else if (contact.person_id) {
-          pass("Pipedrive person lookup", `person ${contact.person_id}`);
-        } else {
-          // The CRM answered; this number simply matches nobody, which is the
-          // correct result for a reserved 555 test number.
-          pass("Pipedrive person lookup", "CRM queried, no match for the test number");
-        }
+  if (token) {
+    const r = await fetch(`${BASE_URL}/api/agent-sip`, { headers: { Authorization: `Bearer ${token}` } });
+    if (r.ok) pass("SIP identity for the softphone", (await r.json()).sipUser);
+    else fail("SIP identity for the softphone", `HTTP ${r.status} — set VOBIZ_SIP_USER / VOBIZ_SIP_PASSWORD`);
+  }
+
+  if (all || args.includes("--answer")) {
+    // What Vobiz fetches when the browser dials. Must be <Dial><Number>.
+    const publicUrl = process.env.TUNNEL_URL;
+    if (!publicUrl) {
+      skip("public answer URL", "TUNNEL_URL is not set");
+    } else {
+      try {
+        const r = await fetch(`${publicUrl.replace(/\/+$/, "")}/answer`, {
+          method: "POST", headers: FORM,
+          body: "From=sip:check@registrar.vobiz.ai&To=919999999999&RouteType=sip",
+        });
+        const xml = await r.text();
+        if (r.ok && /<Dial[^>]*callerId="\+?\d+"[\s\S]*<Number>/.test(xml)) pass("public answer URL returns <Dial><Number>", publicUrl);
+        else fail("public answer URL returns <Dial><Number>", `HTTP ${r.status}: ${xml.slice(0, 120)}`);
+      } catch (err) {
+        fail("public answer URL reachable", err.message);
       }
-    } catch (err) {
-      fail("outbound call", err.message);
     }
   }
 
-  // 3. Inbound Call & Recording Webhook Simulation
-  if (runAll || args.includes("--mock-inbound")) {
-    console.log(`\n[inbound] POST /recording-callback`);
+  if (all || args.includes("--inbound")) {
+    const callUuid = `live-check-${Date.now()}`;
     try {
-      const callUuid = `test-call-uuid-${Date.now()}`;
-      const res = await fetch(`${BASE_URL}/recording-callback`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          CallUUID: callUuid,
-          RecordUrl: "https://media.vobiz.ai/v1/recording/sample-audio.mp3",
-          RecordingID: "test-recording-id",
-          RecordDuration: 42,
-          From: "+15550192834",
-          To: "+15550100000"
-        })
+      const r = await fetch(`${BASE_URL}/recording-callback`, {
+        method: "POST", headers: FORM,
+        body: new URLSearchParams({ CallUUID: callUuid, From: "+15550192834", To: process.env.VOBIZ_FROM_NUMBER || "+15550100000", RecordingDuration: "42" }).toString(),
       });
-      const json = await res.json().catch(() => ({}));
-      // The activity result is nested under `pipedriveActivity`; reading a
-      // top-level `success` reported a failure while activities were in fact
-      // being created.
+      const json = await r.json().catch(() => ({}));
       const activity = json.pipedriveActivity || {};
-      if (!res.ok) {
-        fail("recording callback", `HTTP ${res.status}`);
-      } else if (activity.mocked) {
-        skip("Pipedrive activity sync", "mock mode — nothing was written to any CRM");
-      } else if (activity.pipedriveConfigured === false) {
-        skip("Pipedrive activity sync", "Pipedrive not connected — run /auth/pipedrive");
-      } else if (activity.success && activity.data && activity.data.id) {
-        pass("Pipedrive activity sync", `activity #${activity.data.id}`);
-      } else {
-        fail("Pipedrive activity sync", activity.error || "no activity created");
+      const callLog = json.pipedriveCallLog || {};
+      if (!r.ok) fail("recording callback", `HTTP ${r.status}${r.status === 403 ? " (signature required — run this against VOBIZ_WEBHOOK_SIGNATURES=verify)" : ""}`);
+      else if (activity.mocked) skip("Pipedrive Activity", "ALLOW_MOCK — nothing was written");
+      else if (activity.pipedriveConfigured === false) skip("Pipedrive Activity", "Pipedrive not connected — visit /auth/pipedrive");
+      else {
+        if (activity.success && activity.data && activity.data.id) pass("Pipedrive Activity", `#${activity.data.id}`);
+        else fail("Pipedrive Activity", JSON.stringify(activity.error || activity).slice(0, 200));
+        if (callLog.success && callLog.data && callLog.data.id) pass("Pipedrive Call Log", callLog.data.id);
+        else fail("Pipedrive Call Log", JSON.stringify(callLog.error || callLog).slice(0, 200));
       }
     } catch (err) {
       fail("recording callback", err.message);
     }
   }
 
-  if (runAll || args.includes("--recording-proxy")) {
-    console.log(`\n[recording] GET /recording-file`);
-
+  if (all || args.includes("--recording-proxy")) {
     // The security property is the assertion. This endpoint used to fetch any
     // URL a caller named, with the account's Vobiz credentials attached.
     try {
-      const res = await fetch(`${BASE_URL}/recording-file?url=${encodeURIComponent("https://example.com/")}`);
-      const body = await res.text();
-      if (res.ok && /example domain/i.test(body)) {
-        fail("recording proxy refuses arbitrary URLs", "SSRF: server fetched an attacker-named host");
-      } else {
-        pass("recording proxy refuses arbitrary URLs", `HTTP ${res.status}`);
-      }
+      const r = await fetch(`${BASE_URL}/recording-file?url=${encodeURIComponent("https://example.com/")}`);
+      const body = await r.text();
+      if (r.ok && /example domain/i.test(body)) fail("recording proxy refuses arbitrary URLs", "fetched an attacker-named host");
+      else pass("recording proxy refuses arbitrary URLs", `HTTP ${r.status}`);
     } catch (err) {
       fail("recording proxy refuses arbitrary URLs", err.message);
     }
-
     for (const [name, qs] of [
       ["unsigned link rejected", "recordingId=abc"],
       ["forged signature rejected", "recordingId=abc&exp=99999999999&sig=forged"],
       ["expired signature rejected", "recordingId=abc&exp=1&sig=deadbeef"],
     ]) {
-      try {
-        const res = await fetch(`${BASE_URL}/recording-file?${qs}`);
-        if (res.status === 403) pass(name);
-        else fail(name, `expected 403, got ${res.status}`);
-      } catch (err) {
-        fail(name, err.message);
-      }
+      const r = await fetch(`${BASE_URL}/recording-file?${qs}`);
+      if (r.status === 403) pass(name); else fail(name, `expected 403, got ${r.status}`);
     }
   }
 
-  if (runAll || args.includes("--sync-cdrs")) {
-    console.log(`\n[sync] GET /sync-recent-cdrs`);
-    try {
-      const res = await fetch(`${BASE_URL}/sync-recent-cdrs`);
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        fail("CDR sync", `HTTP ${res.status}`);
-      } else if (json.mocked || json.mockMode) {
-        skip("CDR sync", "mock mode — nothing was written to any CRM");
-      } else if (json.pipedriveConfigured === false || /not configured|Not connected/i.test(JSON.stringify(json))) {
-        skip("CDR sync", "Pipedrive not connected — run /auth/pipedrive");
-      } else if (typeof json.synced === "number") {
-        pass("CDR sync", `${json.synced} record(s)`);
-      } else {
-        fail("CDR sync", "no synced count returned");
+  if (all || args.includes("--sync-cdrs")) {
+    if (!token) {
+      skip("CDR sync", "not signed in");
+    } else {
+      try {
+        const r = await fetch(`${BASE_URL}/sync-recent-cdrs`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+        const json = await r.json().catch(() => ({}));
+        if (!r.ok) fail("CDR sync", `HTTP ${r.status}: ${json.error || ""}`);
+        else if (json.mocked) skip("CDR sync", "ALLOW_MOCK — nothing was written");
+        else if (json.pipedriveConfigured === false) skip("CDR sync", "Pipedrive not connected — visit /auth/pipedrive");
+        else if (typeof json.synced === "number" && json.failed === 0) pass("CDR sync", `${json.synced} of ${json.fetchedCdrs} CDR(s) written`);
+        else fail("CDR sync", `${json.failed} failed of ${json.fetchedCdrs}`);
+      } catch (err) {
+        fail("CDR sync", err.message);
       }
-    } catch (err) {
-      fail("CDR sync", err.message);
     }
   }
 
   summarise();
 }
 
-runTests().catch((err) => console.error("Test execution failed:", err));
+function summarise() {
+  console.log(`\n  ${PASSED} passed, ${FAILED} failed, ${SKIPPED} skipped`);
+  if (SKIPPED) console.log("  Skipped checks are NOT passes — configure the service and re-run.");
+  process.exitCode = FAILED > 0 ? 1 : 0;
+}
+
+main().catch((err) => { console.error("Live checks crashed:", err); process.exitCode = 1; });

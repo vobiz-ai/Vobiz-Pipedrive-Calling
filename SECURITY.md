@@ -29,6 +29,21 @@ drive. Never reintroduce one.
 
 **CORS is an allowlist**, not `*`.
 
+**Sign-in is bound to this server's own account.** The softphone accepts only
+the Auth ID and Auth Token the backend is configured with, compared in
+constant time. Every route that places calls, reads recordings, reads CRM data
+or writes to the CRM requires the resulting session.
+
+**Only the softphone is served.** Static files come from `agent-phone/` and
+`pipedrive-app/` only; `backend/.env`, the token store and the source tree are
+not reachable over HTTP.
+
+**Webhooks can be verified.** Vobiz callback signatures (V3/V2) are checked;
+set `VOBIZ_WEBHOOK_SIGNATURES=require` to reject unsigned callbacks.
+
+**The SIP password is not stored in the browser.** In SIP-direct mode only the
+username and caller ID are remembered.
+
 ### What is not handled
 
 **The backend binds to a single Vobiz account.** Every agent who signs in shares

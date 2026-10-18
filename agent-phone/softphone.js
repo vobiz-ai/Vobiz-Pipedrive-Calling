@@ -6,7 +6,7 @@
  *    - Mode 2: SIP direct (SIP username, SIP password & Outbound Caller ID)
  * 2. Incoming call banner with Web Audio ringtone & Accept/Decline keyboard shortcuts.
  * 3. Inbound call completed notification popup modal + native HTML5 desktop notification.
- * 4. Outbound calling with custom caller ID headers, keypad, live timer, mute, hold, transfer.
+ * 4. Outbound calling with custom caller ID headers, keypad, live timer, mute, hold.
  * 5. Pipedrive contact auto-matching and call recording list with proxy playback.
  */
 
@@ -65,7 +65,6 @@ document.addEventListener("DOMContentLoaded", () => {
   const callControls = document.getElementById("callControls");
   const muteBtn = document.getElementById("muteBtn");
   const holdBtn = document.getElementById("holdBtn");
-  const transferBtn = document.getElementById("transferBtn");
 
   // Pipedrive Contact
   const contactBox = document.getElementById("contactBox");
@@ -89,6 +88,18 @@ document.addEventListener("DOMContentLoaded", () => {
   const SESSION_KEY = "vobiz_pipedrive_session";
 
   let authMode = "account"; // "account" | "sip"
+
+  // Bearer header for the backend routes that read CRM data or recordings.
+  // SIP-direct mode has no backend session, so those features need an
+  // account sign-in.
+  function authHeaders() {
+    try {
+      const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+      return s && s.token ? { Authorization: `Bearer ${s.token}` } : {};
+    } catch {
+      return {};
+    }
+  }
   let accountReady = false;
   let sipRegistered = false;
   let currentCallDirection = "Outbound"; // "Inbound" | "Outbound"
@@ -236,7 +247,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if ("Notification" in window && Notification.permission === "granted") {
       try {
         new Notification("📞 Inbound Call Completed", {
-          body: `Call from ${callerNumber} ended. Duration: ${formatDuration(durationSec)}. Synced to Pipedrive CRM.`,
+          body: `Call from ${callerNumber} ended. Duration: ${formatDuration(durationSec)}.`,
           icon: "/favicon.ico"
         });
       } catch (e) { /* ignore */ }
@@ -528,7 +539,9 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     if (remember) {
-      localStorage.setItem(SIP_CREDS_KEY, JSON.stringify({ username, password, callerId }));
+      // Username and caller ID only. A SIP password in localStorage is readable
+      // by any script on this origin and outlives the session.
+      localStorage.setItem(SIP_CREDS_KEY, JSON.stringify({ username, callerId }));
     } else {
       localStorage.removeItem(SIP_CREDS_KEY);
     }
@@ -537,17 +550,8 @@ document.addEventListener("DOMContentLoaded", () => {
     setLoginStatus(`Connecting as ${cleanUsername}…`);
     setStatus(`Connecting as ${cleanUsername}…`, "pending");
 
-    // Register callerId mapping with backend for outbound calls
-    try {
-      await fetch("/login-sip", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sipUser: cleanUsername, callerId })
-      });
-    } catch (e) {
-      console.warn("[SIP Direct] Backend /login-sip note:", e);
-    }
-
+    // The caller ID travels with each call as an X-VH-Caller-ID SIP header,
+    // so the backend needs no per-user state for it.
     accountReady = true;
     if (logoutBtn) logoutBtn.classList.remove("hidden");
     updateDialButtonState();
@@ -593,13 +597,8 @@ document.addEventListener("DOMContentLoaded", () => {
         const saved = JSON.parse(localStorage.getItem(SIP_CREDS_KEY) || "null");
         if (saved && saved.username) {
           if (sipUserInput) sipUserInput.value = saved.username;
-          if (sipPassInput) sipPassInput.value = saved.password || "";
           if (sipCallerIdInput) sipCallerIdInput.value = saved.callerId || "";
           if (sipRememberCheck) sipRememberCheck.checked = true;
-          if (saved.password && saved.callerId) {
-            sipDirectConnect();
-            return;
-          }
         }
       } catch (e) { /* ignore */ }
     } else {
@@ -762,25 +761,6 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  if (transferBtn) {
-    transferBtn.addEventListener("click", async () => {
-      const target = prompt("Enter phone number or extension to transfer call to:", "+91");
-      if (!target) return;
-      try {
-        log(`Transferring call to ${target}…`, "info");
-        const res = await fetch("/transfer-call", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ target })
-        });
-        const data = await res.json();
-        log(data.message || "Transfer initiated", "success");
-      } catch (e) {
-        log(`Transfer failed: ${e.message}`, "error");
-      }
-    });
-  }
-
   // ─── Pipedrive Contact Lookup ─────────────────────────────────────────────
 
   async function lookupPipedriveContact(phone) {
@@ -790,7 +770,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     try {
-      const res = await fetch(`/api/pipedrive/persons/lookup?phone=${encodeURIComponent(phone)}`);
+      const res = await fetch(`/api/pipedrive/persons/lookup?phone=${encodeURIComponent(phone)}`, { headers: authHeaders() });
       if (res.ok) {
         const contact = await res.json();
         if (contact && contact.name) {
@@ -825,7 +805,11 @@ document.addEventListener("DOMContentLoaded", () => {
     historyList.innerHTML = `<li class="history-empty">Loading recent recordings…</li>`;
 
     try {
-      const res = await fetch("/recordings?limit=10");
+      if (!authHeaders().Authorization) {
+        historyList.innerHTML = `<li class="history-empty">Sign in with your Vobiz account to see recordings.</li>`;
+        return;
+      }
+      const res = await fetch("/recordings?limit=10", { headers: authHeaders() });
       const data = await res.json();
       const list = (data && (data.recordings || data.objects)) || [];
 
@@ -856,7 +840,8 @@ document.addEventListener("DOMContentLoaded", () => {
         audio.controls = true;
         audio.preload = "none";
         audio.className = "history-audio";
-        audio.src = rec.playUrl || `/play-recording?callUuid=${encodeURIComponent(rec.call_uuid || "")}`;
+        if (!rec.playUrl) return;
+        audio.src = rec.playUrl;
 
         li.appendChild(top);
         li.appendChild(audio);

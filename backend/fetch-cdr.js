@@ -92,7 +92,19 @@ async function main() {
     console.log(`🔄 Triggering Pipedrive CDR & Recording Synchronization`);
     console.log(`==================================================`);
     try {
-      const res = await fetch(`http://localhost:${PORT}/sync-recent-cdrs`);
+      // /sync-recent-cdrs writes to the CRM, so it needs a session like any
+      // other caller. Sign in with the same credentials the server holds.
+      const login = await fetch(`http://localhost:${PORT}/api/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ authId: VOBIZ_AUTH_ID, authToken: VOBIZ_AUTH_TOKEN }),
+      });
+      const session = await login.json().catch(() => ({}));
+      if (!login.ok || !session.token) throw new Error(`sign-in failed: ${session.error || login.status}`);
+      const res = await fetch(`http://localhost:${PORT}/sync-recent-cdrs`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.token}` },
+      });
       const syncJson = await res.json();
       console.log(JSON.stringify(syncJson, null, 2));
     } catch (err) {
