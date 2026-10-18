@@ -13,7 +13,7 @@ Thanks for taking a look.
 
 ## Running it
 
-See the setup guide in `docs/`. You need a Vobiz account with a number and
+See the [README](README.md) for setup. You need a Vobiz account with a number and
 balance — every test places a real call and bills it.
 
 ## Reporting a bug
