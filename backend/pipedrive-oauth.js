@@ -159,7 +159,9 @@ async function pipedriveFetch(env, apiPath, options = {}, retried = false) {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      // JSON by default; a FormData body (recording upload) sets its own
+      // multipart boundary and must not be overridden.
+      ...(typeof options.body === "string" ? { "Content-Type": "application/json" } : {}),
       ...(options.headers || {}),
     },
   });

@@ -102,6 +102,55 @@ function isAllowedMediaHost(rawUrl) {
   return MEDIA_HOST_ALLOWLIST.some((re) => re.test(u.hostname));
 }
 
+/**
+ * Download a recording's audio by ID with the server's own credentials.
+ *
+ * Credentials come from the server's config only — never from the query string
+ * or request headers — so a caller cannot supply someone else's or steer where
+ * ours are sent. The media URL comes from the Vobiz API and must be on the
+ * host allowlist, before the request and after every redirect; auth headers
+ * are dropped on redirects, because a presigned URL carries its own.
+ *
+ * Returns { buffer, contentType } or { status, error }.
+ */
+async function fetchRecordingMedia(recordingId) {
+  if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN) {
+    return { status: 500, error: "Vobiz credentials are not configured on this server" };
+  }
+  const authHeaders = { "X-Auth-ID": VOBIZ_AUTH_ID, "X-Auth-Token": VOBIZ_AUTH_TOKEN, Accept: "application/json" };
+  const metaRes = await fetch(
+    `${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Recording/${encodeURIComponent(recordingId)}/`,
+    { headers: authHeaders }
+  );
+  if (!metaRes.ok) return { status: metaRes.status === 404 ? 404 : 502, error: `Vobiz returned ${metaRes.status} for that recording` };
+  const meta = await metaRes.json().catch(() => ({}));
+  const mediaUrl = meta.recording_url || meta.url;
+  if (!mediaUrl) return { status: 404, error: "No audio is available for that recording yet" };
+  if (!isAllowedMediaHost(mediaUrl)) {
+    console.error(`[recording] refusing off-allowlist media host: ${mediaUrl}`);
+    return { status: 502, error: "Recording is hosted somewhere this server will not fetch from" };
+  }
+
+  let mediaRes = await fetch(mediaUrl, { headers: authHeaders, redirect: "manual" });
+  let hops = 0;
+  while (mediaRes.status >= 300 && mediaRes.status < 400 && hops < 3) {
+    const location = mediaRes.headers.get("location");
+    if (!location) break;
+    const next = new URL(location, mediaUrl).toString();
+    if (!isAllowedMediaHost(next)) {
+      console.error(`[recording] refusing redirect to ${next}`);
+      return { status: 502, error: "Recording redirected somewhere this server will not follow" };
+    }
+    mediaRes = await fetch(next, { redirect: "manual" });
+    hops++;
+  }
+  if (!mediaRes.ok) return { status: 502, error: `Media server returned ${mediaRes.status}` };
+  return {
+    contentType: mediaRes.headers.get("content-type") || "audio/mpeg",
+    buffer: Buffer.from(await mediaRes.arrayBuffer()),
+  };
+}
+
 // Opt-in mocking. Without this, an unconfigured server reports failure rather
 // than inventing CRM records that look real.
 const pipedriveOAuth = require("./pipedrive-oauth");
@@ -177,6 +226,21 @@ async function fetchAccountNumbers() {
   numbers = Array.from(new Set(numbers));
   if (numbers.length === 0 && VOBIZ_FROM_NUMBER) numbers = [VOBIZ_FROM_NUMBER];
   return numbers;
+}
+
+const { makeVerifier } = require("./vobiz-signature");
+const verifyVobizWebhook = makeVerifier({
+  mode: cleanEnvVar(process.env.VOBIZ_WEBHOOK_SIGNATURES) || "verify",
+  authToken: VOBIZ_AUTH_TOKEN,
+  publicBaseUrl: () => getPublicBaseUrl() || "",
+});
+
+/** Writes a 403 and returns false when a Vobiz webhook fails verification. */
+function rejectUnverifiedWebhook(req, res, pathname) {
+  if (verifyVobizWebhook(req, pathname)) return false;
+  res.writeHead(403, { "Content-Type": "text/plain" });
+  res.end("invalid signature");
+  return true;
 }
 
 const PIPEDRIVE_ALLOW_API_TOKEN = /^(1|true|yes)$/i.test(cleanEnvVar(process.env.PIPEDRIVE_ALLOW_API_TOKEN));
@@ -382,6 +446,25 @@ function formatDuration(seconds) {
   return `${pad(mins)}:${pad(secs)}`;
 }
 
+/**
+ * Pipedrive activity `duration` is HH:MM. Sending MM:SS — what this used to
+ * do — logged a 42-second call as 42 minutes. Rounded up so a short call is
+ * never shown as zero.
+ */
+function pipedriveActivityDuration(seconds) {
+  const sec = Math.max(0, parseInt(seconds || 0, 10) || 0);
+  const totalMinutes = Math.ceil(sec / 60);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(Math.floor(totalMinutes / 60))}:${pad(totalMinutes % 60)}`;
+}
+
+/** "YYYY-MM-DD HH:MM:SS" in UTC, the format /callLogs requires. */
+function pipedriveUtc(ms) {
+  return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+}
+
+const escapeHtml = (v) => escapeXmlAttr(v).replace(/'/g, "&#39;");
+
 // ==========================================
 // Pipedrive API Integration Helpers
 // ==========================================
@@ -525,32 +608,30 @@ async function createPipedriveActivity(callInfo) {
       : null;
 
     const formattedDuration = formatDuration(callInfo.duration);
-    
-    // HTML Formatted Note for Pipedrive Activity
+
+    // Every value here can come from a webhook, so all of it is escaped
+    // before it goes into HTML that Pipedrive renders.
+    const e = escapeHtml;
     const noteHtml = `
-<h3>📞 VoBiz Telephony Call Log</h3>
+<h3>Vobiz call log</h3>
 <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: sans-serif; font-size: 13px;">
-  <tr style="background-color: #f4f5f7;"><th>Parameter</th><th>Value</th></tr>
-  <tr><td><b>Call UUID</b></td><td><code>${callInfo.callUuid || "N/A"}</code></td></tr>
-  <tr><td><b>Direction</b></td><td>${callInfo.direction}</td></tr>
-  <tr><td><b>From</b></td><td>${callInfo.from}</td></tr>
-  <tr><td><b>To</b></td><td>${callInfo.to}</td></tr>
-  <tr><td><b>Agent</b></td><td>${callInfo.agentName || "System Administrator"}</td></tr>
-  <tr><td><b>Duration</b></td><td>${formattedDuration} (${callInfo.duration || 0}s)</td></tr>
-  <tr><td><b>Hangup Cause</b></td><td><code>${callInfo.hangupCause || "NORMAL_CLEARING"}</code></td></tr>
-  <tr><td><b>Status</b></td><td><span style="color: green; font-weight: bold;">COMPLETED</span></td></tr>
-  <tr><td><b>Timestamp</b></td><td>${new Date().toISOString()}</td></tr>
+  <tr><td><b>Call UUID</b></td><td><code>${e(callInfo.callUuid || "N/A")}</code></td></tr>
+  <tr><td><b>Direction</b></td><td>${e(callInfo.direction)}</td></tr>
+  <tr><td><b>From</b></td><td>${e(callInfo.from)}</td></tr>
+  <tr><td><b>To</b></td><td>${e(callInfo.to)}</td></tr>
+  <tr><td><b>Agent</b></td><td>${e(callInfo.agentName || "")}</td></tr>
+  <tr><td><b>Duration</b></td><td>${e(formattedDuration)} (${e(callInfo.duration || 0)}s)</td></tr>
+  <tr><td><b>Hangup cause</b></td><td><code>${e(callInfo.hangupCause || "")}</code></td></tr>
 </table>
-${proxyRecordingUrl ? `<p style="margin-top:12px;">▶️ <b>Call Recording:</b> <a href="${proxyRecordingUrl}" target="_blank" style="color:#00875a; font-weight:bold;">Listen / Download Audio MP3</a></p>` : "<p><i>No call recording available for this call.</i></p>"}
+${proxyRecordingUrl ? `<p><b>Recording:</b> <a href="${e(proxyRecordingUrl)}" target="_blank" rel="noopener">Listen</a> (link expires; re-open it from the softphone's recordings list)</p>` : "<p><i>No recording for this call.</i></p>"}
 `;
 
     const body = {
-      subject: `VoBiz ${callInfo.direction} Call - ${callInfo.targetNumber}`,
+      subject: `Vobiz ${callInfo.direction} call - ${callInfo.targetNumber || ""}`.trim(),
       type: "call",
       done: 1,
-      duration: formattedDuration,
+      duration: pipedriveActivityDuration(callInfo.duration),
       note: noteHtml,
-      public_description: `VoBiz ${callInfo.direction} Call Log (${formattedDuration})`,
       person_id: callInfo.personId || undefined,
       deal_id: callInfo.dealId || undefined
     };
@@ -578,31 +659,77 @@ ${proxyRecordingUrl ? `<p style="margin-top:12px;">▶️ <b>Call Recording:</b>
   }
 }
 
+/**
+ * POST /callLogs. Pipedrive requires `outcome`, `to_phone_number`,
+ * `start_time` and `end_time`. This used to send `to_call_number`,
+ * `phone_number`, `recording_url` and no end time, so every request was
+ * rejected with a 400 that nothing checked — no Call Log was ever written.
+ * The recording link goes in the note: Pipedrive only takes recordings as a
+ * file upload to /callLogs/{id}/recordings.
+ */
+function buildCallLogBody(callInfo, recordingLink) {
+  const durationSec = Math.max(0, parseInt(callInfo.duration || 0, 10) || 0);
+  const end = callInfo.endTime || Date.now();
+  const start = callInfo.startTime || (end - durationSec * 1000);
+  const answered = durationSec > 0 || /^(completed|answer)/i.test(String(callInfo.dialStatus || ""));
+  return {
+    subject: `Vobiz ${callInfo.direction} call`,
+    outcome: answered ? "connected" : (/busy/i.test(String(callInfo.hangupCause || "")) ? "busy" : "no_answer"),
+    from_phone_number: callInfo.from || undefined,
+    to_phone_number: callInfo.to || callInfo.targetNumber,
+    start_time: pipedriveUtc(start),
+    end_time: pipedriveUtc(Math.max(end, start)),
+    duration: String(durationSec),
+    person_id: callInfo.personId || undefined,
+    deal_id: callInfo.dealId || undefined,
+    note: recordingLink ? `<p>Recording: <a href="${escapeHtml(recordingLink)}">Listen</a></p>` : undefined,
+  };
+}
+
+/**
+ * Attach the audio to the Call Log, so it plays inside Pipedrive for as long
+ * as the record exists. The signed link in the note expires (it has to: it
+ * is readable by everyone on the CRM account), so this is the durable copy.
+ */
+async function uploadCallLogRecording(callLogId, recordingId) {
+  try {
+    const media = await fetchRecordingMedia(recordingId);
+    if (media.error) {
+      console.warn(`[Pipedrive] recording ${recordingId} not attached: ${media.error}`);
+      return { success: false, error: media.error };
+    }
+    const ext = /wav/i.test(media.contentType) ? "wav" : "mp3";
+    const form = new FormData();
+    form.append("file", new Blob([media.buffer], { type: media.contentType }), `${recordingId}.${ext}`);
+    const res = await pipedriveRequest(`/callLogs/${encodeURIComponent(callLogId)}/recordings`, { method: "POST", body: form });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.success) {
+      console.warn(`[Pipedrive] recording upload failed: HTTP ${res.status}`, json.error || "");
+      return { success: false, status: res.status, error: json.error || `HTTP ${res.status}` };
+    }
+    console.log(`[Pipedrive] Attached recording to Call Log ${callLogId}`);
+    return { success: true };
+  } catch (err) {
+    console.warn("[Pipedrive] recording upload error:", err.message);
+    return { success: false, error: err.message };
+  }
+}
+
 async function createPipedriveCallLog(callInfo) {
   if (!pipedriveAvailable()) {
-    return { success: true, mock: true };
+    return { success: false, pipedriveConfigured: false, error: "Pipedrive is not configured on this server" };
   }
 
   try {
     const publicBaseUrl = getPublicBaseUrl() || `http://localhost:${PORT}`;
-    // Signed, expiring, and keyed by recording ID — never the media URL, and
-    // never carrying credentials. This link is written into a CRM note, where
-    // everyone on the account can read it for as long as the record exists.
     const proxyRecordingUrl = callInfo.recordingId
       ? signRecordingUrl(callInfo.recordingId, publicBaseUrl)
       : null;
 
-    const body = {
-      to_call_number: callInfo.to,
-      phone_number: callInfo.from,
-      outcome: "connected",
-      duration: String(callInfo.duration || 0),
-      person_id: callInfo.personId || undefined,
-      deal_id: callInfo.dealId || undefined,
-      has_recording: !!proxyRecordingUrl,
-      recording_url: proxyRecordingUrl || undefined,
-      start_time: new Date().toISOString().slice(0, 19).replace("T", " ")
-    };
+    const body = buildCallLogBody(callInfo, proxyRecordingUrl);
+    if (!body.to_phone_number) {
+      return { success: false, error: "No destination number for this call; call log not written" };
+    }
 
     const res = await pipedriveRequest("/callLogs", {
       method: "POST",
@@ -613,13 +740,19 @@ async function createPipedriveCallLog(callInfo) {
       body: JSON.stringify(body)
     });
 
-    const json = await res.json();
-    if (json.success) {
-      console.log(`[Pipedrive] Successfully created CallLog entry ID #${json.data?.id}`);
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.success) {
+      console.error("[Pipedrive] Call Log creation failed:", res.status, json.error || json);
+      return { success: false, status: res.status, error: json.error || `HTTP ${res.status}` };
+    }
+    const callLogId = json.data && json.data.id;
+    console.log(`[Pipedrive] Created Call Log ${callLogId}`);
+    if (callLogId && callInfo.recordingId) {
+      json.recordingUpload = await uploadCallLogRecording(callLogId, callInfo.recordingId);
     }
     return json;
   } catch (err) {
-    console.error("[Pipedrive] CallLog creation notice:", err.message);
+    console.error("[Pipedrive] Call Log creation error:", err.message);
     return { success: false, error: err.message };
   }
 }
@@ -938,6 +1071,7 @@ const server = http.createServer(async (req, res) => {
 
   // 3. Answer & Fallback Callback - Returns VoBiz XML to Dial Agent Softphone & Record Call
   if ((pathname === "/answer" || pathname === "/fallback") && (req.method === "POST" || req.method === "GET")) {
+    if (rejectUnverifiedWebhook(req, res, pathname)) return;
     try {
       const body = req.method === "POST" ? await readFormOrJsonBody(req) : {};
       const params = { ...parsedUrl.query, ...body };
@@ -1013,6 +1147,7 @@ const server = http.createServer(async (req, res) => {
   // DialBLegUUID is the single most useful field in this stack: empty means no
   // B leg was ever created, whatever the UI said.
   if (pathname === "/dial-status") {
+    if (rejectUnverifiedWebhook(req, res, pathname)) return;
     const d = req.method === "POST" ? { ...parsedUrl.query, ...(await readFormOrJsonBody(req)) } : parsedUrl.query;
     const bleg = d.DialBLegUUID || "";
     console.log(
@@ -1037,53 +1172,71 @@ const server = http.createServer(async (req, res) => {
 
   // 4. Recording Callback from VoBiz Voice Platform
   if (pathname === "/recording-callback" && req.method === "POST") {
+    if (rejectUnverifiedWebhook(req, res, pathname)) return;
     try {
       const body = await readFormOrJsonBody(req);
       console.log("[/recording-callback] Received recording webhook:", body);
 
-      const recordUrl = body.RecordUrl || body.recording_url || body.url;
-      // The ID is what playback links are keyed on now — the raw media URL is
+      const recordUrl = body.RecordUrl || body.RecordFile || body.recording_url || null;
+      // The ID is what playback links are keyed on — the raw media URL is
       // never handed to a browser or written into a CRM note.
       const recordingId = body.RecordingID || body.RecordingId || body.recording_id || null;
-      const duration = parseInt(body.RecordDuration || body.duration || 0, 10);
-      const callUuid = body.CallUUID || body.call_uuid || body.request_uuid || `rec-${Date.now()}`;
-      const fromNumber = body.From || body.from || VOBIZ_FROM_NUMBER;
-      const toNumber = body.To || body.to || "+15550192834";
+      // Vobiz sends RecordingDuration; RecordDuration was never a field, so
+      // every activity used to be logged with a zero duration.
+      const duration = parseInt(body.RecordingDuration || body.RecordDuration || body.duration || 0, 10) || 0;
+      const callUuid = body.CallUUID || body.call_uuid || "";
+      if (!callUuid) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "CallUUID is required" }));
+        return;
+      }
+      const fromNumber = String(body.From || body.from || "");
+      const toNumber = String(body.To || body.to || "");
 
       let callInfo = activeCalls.get(callUuid);
       if (!callInfo) {
-        // Fallback for inbound or untracked calls
-        const personMatch = await getPipedrivePersonByPhone(fromNumber === VOBIZ_FROM_NUMBER ? toNumber : fromNumber);
+        // A call this process did not see answered (e.g. after a restart).
+        // Infer what we can; never invent a number.
+        const outbound = fromNumber.startsWith("sip:") || fromNumber === VOBIZ_FROM_NUMBER;
+        const target = outbound ? toNumber : fromNumber;
+        const personMatch = target ? await getPipedrivePersonByPhone(target) : {};
         callInfo = {
           callUuid,
-          direction: fromNumber === VOBIZ_FROM_NUMBER ? "Outbound" : "Inbound",
+          direction: outbound ? "Outbound" : "Inbound",
           from: fromNumber,
           to: toNumber,
-          targetNumber: fromNumber === VOBIZ_FROM_NUMBER ? toNumber : fromNumber,
-          agentName: "System Administrator",
-          pipedriveUserId: 1001,
+          targetNumber: target,
+          agentName: "",
           personId: personMatch.person_id,
           personName: personMatch.name,
           dealId: personMatch.deal_id
         };
+      } else if (!callInfo.personId && callInfo.targetNumber) {
+        const personMatch = await getPipedrivePersonByPhone(callInfo.targetNumber);
+        callInfo.personId = personMatch.person_id;
+        callInfo.personName = personMatch.name;
+        callInfo.dealId = personMatch.deal_id;
       }
 
       callInfo.recordingUrl = recordUrl;
       callInfo.recordingId = recordingId;
-      callInfo.duration = duration;
-      callInfo.hangupCause = callInfo.hangupCause || "NORMAL_CLEARING";
+      // Prefer the bridged B-leg duration from /dial-status when we have it.
+      callInfo.duration = callInfo.duration || duration;
+      callInfo.endTime = callInfo.endTime || Date.now();
 
       callRecordings.set(callUuid, callInfo);
 
-      // Create Activity and CallLog in Pipedrive
+      // Create Activity and Call Log in Pipedrive
       const activityRes = await createPipedriveActivity(callInfo);
-      await createPipedriveCallLog(callInfo);
+      const callLogRes = await createPipedriveCallLog(callInfo);
+      callInfo.crmSynced = Boolean(activityRes && activityRes.success && !activityRes.mocked);
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "recording_logged",
         callUuid,
-        pipedriveActivity: activityRes
+        pipedriveActivity: activityRes,
+        pipedriveCallLog: callLogRes
       }));
     } catch (err) {
       console.error("[/recording-callback] Error:", err.message);
@@ -1095,6 +1248,7 @@ const server = http.createServer(async (req, res) => {
 
   // 5. Hangup Callback / CDR Metadata Callback
   if (pathname === "/hangup-callback" && req.method === "POST") {
+    if (rejectUnverifiedWebhook(req, res, pathname)) return;
     try {
       const body = await readFormOrJsonBody(req);
       console.log("[/hangup-callback] Received hangup webhook:", body);
@@ -1195,76 +1349,14 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Credentials come from the server's own config. They are never read from
-      // the query string or from request headers, so a caller cannot supply
-      // someone else's and cannot steer where ours are sent.
-      if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Vobiz credentials are not configured on this server" }));
+      const media = await fetchRecordingMedia(recordingId);
+      if (media.error) {
+        res.writeHead(media.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: media.error }));
         return;
       }
-      const authHeaders = {
-        "X-Auth-ID": VOBIZ_AUTH_ID,
-        "X-Auth-Token": VOBIZ_AUTH_TOKEN,
-        Accept: "application/json"
-      };
-
-      const metaRes = await fetch(
-        `${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Recording/${encodeURIComponent(recordingId)}/`,
-        { headers: authHeaders }
-      );
-      if (!metaRes.ok) {
-        res.writeHead(metaRes.status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Vobiz returned ${metaRes.status} for that recording` }));
-        return;
-      }
-      const meta = await metaRes.json().catch(() => ({}));
-      const mediaUrl = meta.recording_url || meta.url;
-      if (!mediaUrl) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "No audio is available for that recording yet" }));
-        return;
-      }
-      if (!isAllowedMediaHost(mediaUrl)) {
-        console.error(`[/recording-file] refusing off-allowlist media host: ${mediaUrl}`);
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Recording is hosted somewhere this server will not fetch from" }));
-        return;
-      }
-
-      let mediaRes = await fetch(mediaUrl, { headers: authHeaders, redirect: "manual" });
-
-      // Recordings are commonly served as a redirect to presigned object
-      // storage. Follow one hop, but re-check the host — and drop the auth
-      // headers, because a presigned URL carries its own authorisation and
-      // forwarding ours to a third party is the bug this endpoint just had.
-      let hops = 0;
-      while (mediaRes.status >= 300 && mediaRes.status < 400 && hops < 3) {
-        const location = mediaRes.headers.get("location");
-        if (!location) break;
-        const next = new URL(location, mediaUrl).toString();
-        if (!isAllowedMediaHost(next)) {
-          console.error(`[/recording-file] refusing redirect to ${next}`);
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Recording redirected somewhere this server will not follow" }));
-          return;
-        }
-        mediaRes = await fetch(next, { redirect: "manual" });
-        hops++;
-      }
-
-      if (!mediaRes.ok) {
-        res.writeHead(mediaRes.status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Media server returned ${mediaRes.status}` }));
-        return;
-      }
-
-      const contentType = mediaRes.headers.get("content-type") || "audio/mpeg";
-      const headersOut = { "Content-Type": contentType, "Accept-Ranges": "bytes" };
-      const len = mediaRes.headers.get("content-length");
-      if (len) headersOut["Content-Length"] = len;
-      res.writeHead(200, headersOut);
-      res.end(Buffer.from(await mediaRes.arrayBuffer()));
+      res.writeHead(200, { "Content-Type": media.contentType, "Content-Length": media.buffer.length, "Cache-Control": "private, no-store" });
+      res.end(media.buffer);
     } catch (err) {
       console.error("[/recording-file] error:", err.message);
       res.writeHead(500, { "Content-Type": "application/json" });
