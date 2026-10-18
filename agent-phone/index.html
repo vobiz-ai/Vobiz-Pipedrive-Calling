@@ -129,11 +129,15 @@
 
               <div class="form-group">
                 <label class="field-label" for="loginAgentSelect">Agent Profile</label>
-                <select id="loginAgentSelect" class="input">
-                  <option value="admin">System Administrator (admin@yourcompany.pipedrive.com)</option>
-                  <option value="john">John Doe (john.doe@yourcompany.com)</option>
-                  <option value="jane">Jane Smith (jane.smith@yourcompany.com)</option>
-                </select>
+                <!-- Filled from the backend's agents.json (GET /api/agents). Any
+                     other id can be typed to create a new profile. -->
+                <input type="text" id="loginAgentSelect" class="input input-mono" list="agentProfiles"
+                       placeholder="Pick a profile or type a new id" autocomplete="off"
+                       pattern="[A-Za-z0-9_\-]{1,40}" maxlength="40" />
+                <datalist id="agentProfiles"></datalist>
+                <p class="hint" id="agent-profile-hint">
+                  Letters, digits, - and _. Each person needs their own profile.
+                </p>
               </div>
 
               <button id="vobiz-login-btn" class="btn btn-primary" type="button">
@@ -195,6 +199,10 @@
           <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 8px;">
             <p id="vobiz-login-status" class="hint">Not signed in.</p>
             <button id="logoutBtn" class="btn-logout hidden" type="button">Sign out</button>
+          </div>
+          <div id="pipedrive-connection" class="hidden" style="display: flex; align-items: center; justify-content: space-between; margin-top: 4px;">
+            <p id="pipedrive-connection-status" class="hint">Pipedrive connected.</p>
+            <button id="pipedriveDisconnectBtn" class="btn-logout" type="button">Disconnect Pipedrive</button>
           </div>
         </section>
 
@@ -350,9 +358,9 @@
         </summary>
 
         <div class="faq-item">
-          <h3>Why does the person I call hear ringing after answering?</h3>
+          <h3>How is a call placed?</h3>
           <p>
-            Vobiz dials the customer first, then bridges your browser in. Those few seconds of ringback are that second leg connecting.
+            Your browser places the call to Vobiz. The backend then has Vobiz dial the customer from the number you picked and connects them to you. The ringing you hear is the customer's phone.
           </p>
         </div>
 
@@ -366,7 +374,7 @@
         <div class="faq-item">
           <h3>Where do call recordings go?</h3>
           <p>
-            Calls are recorded on Vobiz, displayed in the list above, and automatically logged to matching contacts and deals in Pipedrive.
+            Calls are recorded on Vobiz and listed above. Each call is logged in Pipedrive as an Activity and a Call Log on the contact whose phone number matches. When that contact has exactly one open deal, the call is linked to that deal too.
           </p>
         </div>
       </details>

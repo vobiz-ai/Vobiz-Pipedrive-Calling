@@ -190,10 +190,9 @@ refreshes the access token on its own. Do this step right after you deploy:
 until a company is connected, anyone who can reach `/auth/pipedrive` can
 connect one.
 
-To connect a different Pipedrive company later, disconnect first with a
-signed-in session (`POST /auth/pipedrive/disconnect` with the session's
-`Authorization: Bearer <token>`), or stop the backend and delete
-`backend/.pipedrive-tokens.json`. Then authorize again.
+To connect a different Pipedrive company later, sign in to the softphone with
+your Vobiz account and press **Disconnect Pipedrive**, or stop the backend and
+delete `backend/.pipedrive-tokens.json`. Then authorize again.
 
 ### 3. Open the softphone
 
@@ -203,7 +202,7 @@ The softphone is a web page served by your backend:
 |---|---|
 | `https://calling.example.com/` | The softphone |
 | `https://calling.example.com/agent-phone/index.html` | The same softphone, by its full path |
-| `https://calling.example.com/pipedrive-app/pipedrive-cti-app.html` | The Pipedrive CTI app page. It redirects to the softphone |
+| `https://calling.example.com/pipedrive-app/pipedrive-cti-app.html` | The Pipedrive CTI app page. Opened directly, it redirects to the softphone; inside a frame it shows a link that opens the softphone in its own tab |
 
 Agents keep the softphone open in its own browser tab, next to Pipedrive. The
 page must stay open to receive calls.
@@ -246,10 +245,20 @@ backend refuses any other number.
 
 **Agent profiles.** Each profile gets its own endpoint. Give each person their
 own profile: signing in sets a new SIP password, so a second browser on the
-same profile disconnects the first. The panel offers three profiles, `admin`,
-`john` and `jane`. Copy `backend/agents.example.json` to `backend/agents.json`
-to set their display names; to offer more profiles, add matching `<option>`
-entries to the **Agent Profile** list in `agent-phone/index.html`.
+same profile disconnects the first. Type any profile ID (letters, digits, `-`
+or `_`) in the **Agent Profile** field. To suggest profiles in that field and
+give them display names, copy `backend/agents.example.json` to
+`backend/agents.json` (or point `AGENTS_FILE` at your own file) and edit it:
+
+```json
+{
+  "priya": { "name": "Priya Sharma", "pipedriveUserId": 12345678 }
+}
+```
+
+`pipedriveUserId` is optional. When set, that agent's Activities and Call Logs
+are owned by that Pipedrive user. The file is read on each use, so edits apply
+without a restart.
 
 #### Enable inbound calls
 
@@ -346,7 +355,8 @@ tab open to receive calls.
 ### What is written to Pipedrive
 
 When Vobiz reports that a call's recording is ready, the backend writes two
-records, as the Pipedrive user who authorized the app:
+records. They are owned by the agent's `pipedriveUserId` when the profile has
+one, and otherwise by the Pipedrive user who authorized the app:
 
 - **An Activity** of type *Call*, marked done, with:
   - subject `Vobiz Outbound call - +91XXXXXXXXXX` (or `Inbound`);
@@ -359,7 +369,8 @@ records, as the Pipedrive user who authorized the app:
 
 Both are linked to the Pipedrive person whose phone number matches the other
 party (the number dialled, or the inbound caller). If no person matches, the
-records are created without a person.
+records are created without a person. When that person has exactly one open
+deal, the records are linked to that deal too.
 
 Calls that are not answered produce no recording, so they are not logged.
 
@@ -413,7 +424,7 @@ Auth Token, SIP credentials or numbers go here.
 | `PIPEDRIVE_ALLOW_API_TOKEN` | No | `0` | Set to `1` to use a personal API token instead of OAuth. OAuth takes priority when connected |
 | `PIPEDRIVE_API_TOKEN` | No | — | Personal API token, used only with `PIPEDRIVE_ALLOW_API_TOKEN=1` |
 | `PIPEDRIVE_API_URL` | No | `https://api.pipedrive.com/v1` | API base for the personal-token mode. OAuth uses the company domain Pipedrive returns |
-| `PIPEDRIVE_COMPANY_DOMAIN` | No | `yourcompany` | Not used. Leave unset |
+| `AGENTS_FILE` | No | `backend/agents.json` | Agent profiles offered in the softphone, with optional display names and `pipedriveUserId`. Optional; any typed profile ID works without it |
 | `ALLOW_MOCK` | No | `0` | Development only. `1` returns clearly labelled sample CRM data when Pipedrive is not connected. It never bypasses sign-in |
 | `VOBIZ_ENV_FILE` | No | `backend/.env` | Path of the configuration file to load |
 
@@ -510,7 +521,8 @@ other party.
 | Activity is not linked to a person | No Pipedrive person has that phone number | Add the number to the person in Pipedrive |
 | Listen link says *invalid or has expired* | The link is older than `RECORDING_URL_TTL_SECONDS`, or the backend restarted without a fixed `SIGNING_SECRET` | Play the audio on the Call Log, or from the softphone's recordings list |
 | Listen link says to sign in again | The backend restarted and holds no credentials for that account yet | Sign in to the softphone with that account, then reopen the link |
-| `/auth/pipedrive` says *Already connected* | A Pipedrive company is already connected | Disconnect first (see [Authorize](#2-authorize)) |
+| `/auth/pipedrive` says *Already connected* | A Pipedrive company is already connected | Press **Disconnect Pipedrive** in the softphone first (see [Authorize](#2-authorize)) |
+| Activities are owned by the wrong Pipedrive user | The profile has no `pipedriveUserId`, or a wrong one | Set the agent's Pipedrive user ID in `agents.json` |
 | OAuth callback says *Authorisation rejected* | The approval took longer than 10 minutes, or the backend restarted during it | Start again from `/auth/pipedrive` |
 
 ## Limitations
@@ -524,11 +536,10 @@ other party.
 - **Unanswered calls are not logged.** Logging happens when the recording is
   ready, and an unanswered call has none. `npm run fetch-cdr` can backfill,
   without de-duplication.
-- **Activities are not linked to deals**, and are owned by the Pipedrive user
-  who authorized the app, not by the agent who took the call.
+- **A call is linked to a deal only when the contact has exactly one open
+  deal.** With several open deals, link the Activity by hand.
 - **One browser per agent profile.** Signing in on a second browser rotates
-  the SIP password and disconnects the first. The panel ships with three
-  profiles.
+  the SIP password and disconnects the first.
 - **The softphone runs in its own browser tab.** It does not yet run as an
   embedded Pipedrive panel or floating window, and it is not listed on the
   Pipedrive Marketplace.

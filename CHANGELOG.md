@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — agent profiles, panel text, Pipedrive disconnect
+
+- The Agent Profile picker is filled from `agents.json` via `GET /api/agents`
+  (ids and names only) and accepts a typed new id; no names are hard-coded.
+- `pipedriveUserId` in `agents.json` sets the Activity and Call Log owner.
+- Calls are linked to the contact's deal when it has exactly one open deal.
+- Panel FAQ describes the real call flow; "Disconnect Pipedrive" button added.
+- The CTI page says it opens the softphone in its own tab.
+- Removed the unused `PIPEDRIVE_COMPANY_DOMAIN` setting.
+
 ### Documentation
 
 - README rewritten as a customer setup and operations guide: Pipedrive app
