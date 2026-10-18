@@ -42,9 +42,9 @@ function handleOutput(text) {
         console.log(`🎉 PUBLIC TUNNEL ESTABLISHED!`);
         console.log(`==================================================`);
         console.log(`🔗 Public Base URL: ${publicUrl}`);
-        console.log(`📞 VoBiz Answer Callback:            ${publicUrl}/answer`);
-        console.log(`🎙️  VoBiz Recording Callback:         ${publicUrl}/recording-callback`);
-        console.log(`🔚 VoBiz Hangup Callback:            ${publicUrl}/hangup-callback`);
+        console.log(`📞 Vobiz Answer Callback:            ${publicUrl}/answer`);
+        console.log(`🎙️  Vobiz Recording Callback:         ${publicUrl}/recording-callback`);
+        console.log(`🔚 Vobiz Hangup Callback:            ${publicUrl}/hangup-callback`);
         console.log(`🔐 Pipedrive OAuth callback:         ${publicUrl}/auth/pipedrive/callback`);
         console.log(`\nThe hostname changes on every restart: update the Vobiz application's`);
         console.log(`answer_url / hangup_url and the Pipedrive app's callback URL to match.`);
