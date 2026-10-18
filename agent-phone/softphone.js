@@ -458,7 +458,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const agentId = agentSelect ? agentSelect.value : "admin";
 
     if (!authId || !authToken) {
-      setLoginStatus("Enter both VoBiz Auth ID and Auth Token.");
+      setLoginStatus("Enter both Vobiz Auth ID and Auth Token.");
       return;
     }
 
@@ -469,7 +469,7 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    setLoginStatus("Signing in to VoBiz…");
+    setLoginStatus("Signing in to Vobiz…");
     setStatus("Authenticating…", "pending");
     if (accountLoginBtn) accountLoginBtn.disabled = true;
 
@@ -496,7 +496,7 @@ document.addEventListener("DOMContentLoaded", () => {
         setLoginStatus(`Signed in as ${data.authId}`);
         if (logoutBtn) logoutBtn.classList.remove("hidden");
         updateDialButtonState();
-        log(`VoBiz Account signed in (${data.authId})`, "success");
+        log(`Vobiz Account signed in (${data.authId})`, "success");
 
         // Connect SIP using account session
         window.VobizSip.connect({

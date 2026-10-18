@@ -530,7 +530,7 @@ async function getPipedrivePersonByPhone(phoneNumber) {
       name: "Sample Pipedrive Contact (MOCK)",
       email: "contact@example.com",
       deal_id: 201,
-      deal_title: "VoBiz Enterprise Expansion Deal"
+      deal_title: "Vobiz Enterprise Expansion Deal"
     };
   }
 
@@ -590,7 +590,7 @@ async function createPipedriveActivity(callInfo) {
       success: true,
       data: {
         id: Math.floor(Math.random() * 900000) + 100000,
-        subject: `VoBiz ${callInfo.direction} Call - ${callInfo.targetNumber}`,
+        subject: `Vobiz ${callInfo.direction} Call - ${callInfo.targetNumber}`,
         done: true,
         type: "call",
         duration: callInfo.duration
@@ -1069,7 +1069,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 3. Answer & Fallback Callback - Returns VoBiz XML to Dial Agent Softphone & Record Call
+  // 3. Answer & Fallback Callback - Returns Vobiz XML to Dial Agent Softphone & Record Call
   if ((pathname === "/answer" || pathname === "/fallback") && (req.method === "POST" || req.method === "GET")) {
     if (rejectUnverifiedWebhook(req, res, pathname)) return;
     try {
@@ -1170,7 +1170,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 4. Recording Callback from VoBiz Voice Platform
+  // 4. Recording Callback from Vobiz Voice Platform
   if (pathname === "/recording-callback" && req.method === "POST") {
     if (rejectUnverifiedWebhook(req, res, pathname)) return;
     try {
@@ -1476,7 +1476,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`\n==================================================`);
-  console.log(`🚀 VoBiz Pipedrive Backend Server Running`);
+  console.log(`🚀 Vobiz Pipedrive Backend Server Running`);
   console.log(`==================================================`);
   console.log(`- Local URL:        http://localhost:${PORT}`);
   console.log(`- Softphone UI:     http://localhost:${PORT}/agent-phone/index.html`);

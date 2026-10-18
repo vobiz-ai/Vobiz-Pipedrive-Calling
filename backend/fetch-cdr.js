@@ -1,4 +1,4 @@
-// CLI Tool to fetch live VoBiz CDRs and Call Recordings and sync them to Pipedrive
+// CLI Tool to fetch live Vobiz CDRs and Call Recordings and sync them to Pipedrive
 // Usage: node backend/fetch-cdr.js [--sync]
 
 const fs = require("fs");
@@ -25,11 +25,11 @@ const { VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN, VOBIZ_API_URL = "https://api.vobiz.ai",
 
 async function main() {
   console.log(`\n==================================================`);
-  console.log(`📡 Fetching VoBiz CDRs & Recordings for ${VOBIZ_AUTH_ID || "Account"}`);
+  console.log(`📡 Fetching Vobiz CDRs & Recordings for ${VOBIZ_AUTH_ID || "Account"}`);
   console.log(`==================================================`);
 
   if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN || VOBIZ_AUTH_ID.includes("YOUR_")) {
-    console.error("❌ VoBiz API credentials (VOBIZ_AUTH_ID / VOBIZ_AUTH_TOKEN) not configured in backend/.env");
+    console.error("❌ Vobiz API credentials (VOBIZ_AUTH_ID / VOBIZ_AUTH_TOKEN) not configured in backend/.env");
     console.log("ℹ️  Running in demonstration mode.");
   }
 
