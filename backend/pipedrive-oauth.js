@@ -23,7 +23,8 @@ const path = require("path");
 const AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize";
 const TOKEN_URL = "https://oauth.pipedrive.com/oauth/token";
 
-const TOKEN_STORE = path.join(__dirname, ".pipedrive-tokens.json");
+// PIPEDRIVE_TOKEN_STORE moves the file (the test suite uses a temp path).
+const TOKEN_STORE = process.env.PIPEDRIVE_TOKEN_STORE || path.join(__dirname, ".pipedrive-tokens.json");
 
 // Outstanding `state` values, so a callback cannot be forged or replayed.
 const pendingStates = new Map();

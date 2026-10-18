@@ -6,12 +6,12 @@
   "scripts": {
     "start": "node backend/server.js",
     "tunnel": "node backend/tunnel.js",
-    "test:outbound": "node backend/test-pipedrive-sync.js --mock-outbound",
-    "test:inbound": "node backend/test-pipedrive-sync.js --mock-inbound",
+    "test": "node --test backend/test/*.test.js",
+    "test:live": "node backend/test-pipedrive-sync.js",
+    "test:inbound": "node backend/test-pipedrive-sync.js --inbound",
     "test:recording": "node backend/test-pipedrive-sync.js --recording-proxy",
     "test:sync": "node backend/test-pipedrive-sync.js --sync-cdrs",
     "fetch-cdr": "node backend/fetch-cdr.js --sync",
-    "test": "node backend/test-pipedrive-sync.js",
     "oauth:status": "node -e \"process.loadEnvFile('./backend/.env');fetch(process.env.TUNNEL_URL+'/auth/pipedrive/status').then(r=>r.json()).then(d=>console.log(d))\""
   },
   "keywords": [
@@ -34,5 +34,8 @@
   "bugs": {
     "url": "https://github.com/vobiz-ai/Vobiz-Pipedrive-Calling/issues"
   },
-  "homepage": "https://github.com/vobiz-ai/Vobiz-Pipedrive-Calling#readme"
+  "homepage": "https://github.com/vobiz-ai/Vobiz-Pipedrive-Calling#readme",
+  "engines": {
+    "node": ">=18.18"
+  }
 }

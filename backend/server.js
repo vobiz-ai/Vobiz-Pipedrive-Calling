@@ -2,20 +2,23 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
+const { resolveStaticFile, contentTypeFor } = require("./static-files");
 
-// Load environment variables from .env file
+// Load environment variables from backend/.env, or from VOBIZ_ENV_FILE when set
+// (the test suite points this at a throwaway file so it never reads real
+// credentials). Variables already in the environment win.
+const ENV_FILE = process.env.VOBIZ_ENV_FILE || path.join(__dirname, ".env");
 try {
-  process.loadEnvFile(path.join(__dirname, ".env"));
+  if (fs.existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
 } catch (e) {
-  const envPath = path.join(__dirname, ".env");
-  if (fs.existsSync(envPath)) {
-    const lines = fs.readFileSync(envPath, "utf8").split("\n");
+  if (fs.existsSync(ENV_FILE)) {
+    const lines = fs.readFileSync(ENV_FILE, "utf8").split("\n");
     for (const line of lines) {
       const idx = line.indexOf("=");
       if (idx !== -1 && !line.trim().startsWith("#")) {
         const key = line.slice(0, idx).trim();
         const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
-        if (key) process.env[key] = val;
+        if (key && process.env[key] === undefined) process.env[key] = val;
       }
     }
   }
@@ -1604,34 +1607,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 9. Static File Server for Agent Softphone & Pipedrive App UI
-  let filePath = path.join(__dirname, "..", pathname);
-  if (pathname === "/") {
-    filePath = path.join(__dirname, "..", "agent-phone", "index.html");
-  } else if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
-    const agentPhonePath = path.join(__dirname, "..", "agent-phone", pathname);
-    if (fs.existsSync(agentPhonePath) && fs.statSync(agentPhonePath).isFile()) {
-      filePath = agentPhonePath;
+  // 9. Static files: the softphone and the Pipedrive panel, nothing else.
+  if (req.method === "GET" || req.method === "HEAD") {
+    const filePath = resolveStaticFile(pathname);
+    if (filePath) {
+      res.writeHead(200, { "Content-Type": contentTypeFor(filePath), "X-Content-Type-Options": "nosniff" });
+      if (req.method === "HEAD") { res.end(); return; }
+      fs.createReadStream(filePath).pipe(res);
+      return;
     }
   }
 
-  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-    const ext = path.extname(filePath).toLowerCase();
-    const mimeTypes = {
-      ".html": "text/html",
-      ".js": "text/javascript",
-      ".css": "text/css",
-      ".json": "application/json",
-      ".png": "image/png",
-      ".svg": "image/svg+xml"
-    };
-    res.writeHead(200, { "Content-Type": mimeTypes[ext] || "text/plain" });
-    fs.createReadStream(filePath).pipe(res);
-    return;
-  }
-
   res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "Endpoint or static resource not found", path: pathname }));
+  res.end(JSON.stringify({ error: "Not found" }));
 });
 
 server.listen(PORT, () => {
