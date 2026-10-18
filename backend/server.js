@@ -1419,13 +1419,13 @@ const server = http.createServer(async (req, res) => {
           from: cdr.caller_id_number,
           to: cdr.destination_number,
           targetNumber,
-          agentName: "System Administrator",
-          pipedriveUserId: 1001,
+          agentName: "",
           personId: personMatch.person_id,
           personName: personMatch.name,
           dealId: personMatch.deal_id,
           duration: cdr.duration || 0,
-          hangupCause: cdr.hangup_cause || "NORMAL_CLEARING",
+          startTime: Date.parse(cdr.start_time) || undefined,
+          hangupCause: cdr.hangup_cause || "",
           recordingUrl: cdr.recording_url || null
         };
 
