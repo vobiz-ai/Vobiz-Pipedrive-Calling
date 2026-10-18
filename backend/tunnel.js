@@ -45,7 +45,9 @@ function handleOutput(text) {
         console.log(`📞 VoBiz Answer Callback:            ${publicUrl}/answer`);
         console.log(`🎙️  VoBiz Recording Callback:         ${publicUrl}/recording-callback`);
         console.log(`🔚 VoBiz Hangup Callback:            ${publicUrl}/hangup-callback`);
-        console.log(`▶️  Recording MP3 Proxy:              ${publicUrl}/recording-file?url=...`);
+        console.log(`🔐 Pipedrive OAuth callback:         ${publicUrl}/auth/pipedrive/callback`);
+        console.log(`\nThe hostname changes on every restart: update the Vobiz application's`);
+        console.log(`answer_url / hangup_url and the Pipedrive app's callback URL to match.`);
         console.log(`==================================================\n`);
       }
     }
