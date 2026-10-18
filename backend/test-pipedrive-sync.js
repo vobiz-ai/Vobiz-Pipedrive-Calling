@@ -1,5 +1,13 @@
 // Live checks against a RUNNING backend (npm start) and its real services.
-// Usage: node backend/test-pipedrive-sync.js [--answer] [--inbound] [--recording-proxy] [--sync-cdrs]
+// Usage:
+//   AUTH_ID=... AUTH_TOKEN=... CALLER_ID=+... node backend/test-pipedrive-sync.js \
+//     [--answer] [--inbound] [--recording-proxy] [--sync-cdrs]
+//   (or --auth-id / --auth-token / --caller-id flags)
+//
+// The Vobiz account is supplied at runtime only, from those flags or
+// environment variables — never from backend/.env, and there are no defaults.
+// Signing in provisions this integration's application and an endpoint in
+// that account, exactly as the softphone does.
 //
 // For the offline suite, which needs no credentials and no network, run
 // `npm test`.
@@ -21,6 +29,14 @@ const path = require("path");
 const envFile = process.env.VOBIZ_ENV_FILE || path.join(__dirname, ".env");
 try { if (fs.existsSync(envFile)) process.loadEnvFile(envFile); } catch { /* Node < 20.12: use real env vars */ }
 
+function arg(name) {
+  const i = process.argv.indexOf(name);
+  return i !== -1 && process.argv[i + 1] && !process.argv[i + 1].startsWith("--") ? process.argv[i + 1] : "";
+}
+const AUTH_ID = arg("--auth-id") || process.env.AUTH_ID || "";
+const AUTH_TOKEN = arg("--auth-token") || process.env.AUTH_TOKEN || "";
+const CALLER_ID = arg("--caller-id") || process.env.CALLER_ID || "";
+
 const PORT = process.env.PORT || 8092;
 const BASE_URL = `http://localhost:${PORT}`;
 const FORM = { "Content-Type": "application/x-www-form-urlencoded" };
@@ -29,14 +45,14 @@ async function signIn() {
   const r = await fetch(`${BASE_URL}/api/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ authId: process.env.VOBIZ_AUTH_ID || "", authToken: process.env.VOBIZ_AUTH_TOKEN || "" }),
+    body: JSON.stringify({ authId: AUTH_ID, authToken: AUTH_TOKEN }),
   });
   const j = await r.json().catch(() => ({}));
-  return r.ok && j.token ? j.token : null;
+  return r.ok && j.token ? j : null;
 }
 
 async function main() {
-  const args = process.argv.slice(2);
+  const args = process.argv.slice(2).filter((a, i, list) => a.startsWith("--") && !["--auth-id", "--auth-token", "--caller-id"].includes(a) && !["--auth-id", "--auth-token", "--caller-id"].includes(list[i - 1]));
   const all = args.length === 0;
 
   console.log(`\nLive checks against ${BASE_URL}\n`);
@@ -52,26 +68,40 @@ async function main() {
     return summarise();
   }
 
-  const token = await signIn();
-  if (token) pass("sign in with VOBIZ_AUTH_ID / VOBIZ_AUTH_TOKEN");
-  else fail("sign in", "the server rejected the credentials in backend/.env");
+  let token = null;
+  let sipUser = "";
+  let numbers = [];
+  if (!AUTH_ID || !AUTH_TOKEN) {
+    skip("sign in", "pass --auth-id and --auth-token (or AUTH_ID / AUTH_TOKEN)");
+  } else {
+    const session = await signIn();
+    if (session) {
+      token = session.token;
+      numbers = session.numbers || [];
+      pass("sign in and provision", `${numbers.length} caller ID(s) on the account`);
+    } else {
+      fail("sign in", "the server rejected the credentials, or provisioning failed (see the server log)");
+    }
+  }
 
   if (token) {
     const r = await fetch(`${BASE_URL}/api/agent-sip`, { headers: { Authorization: `Bearer ${token}` } });
-    if (r.ok) pass("SIP identity for the softphone", (await r.json()).sipUser);
-    else fail("SIP identity for the softphone", `HTTP ${r.status} — set VOBIZ_SIP_USER / VOBIZ_SIP_PASSWORD`);
+    if (r.ok) { sipUser = (await r.json()).sipUser; pass("SIP identity for the softphone", sipUser); }
+    else fail("SIP identity for the softphone", `HTTP ${r.status}`);
   }
 
   if (all || args.includes("--answer")) {
     // What Vobiz fetches when the browser dials. Must be <Dial><Number>.
-    const publicUrl = process.env.TUNNEL_URL;
+    const publicUrl = process.env.TUNNEL_URL || process.env.PUBLIC_BASE_URL;
     if (!publicUrl) {
       skip("public answer URL", "TUNNEL_URL is not set");
+    } else if (!sipUser) {
+      skip("public answer URL", "not signed in, so there is no SIP user to route");
     } else {
       try {
         const r = await fetch(`${publicUrl.replace(/\/+$/, "")}/answer`, {
           method: "POST", headers: FORM,
-          body: "From=sip:check@registrar.vobiz.ai&To=919999999999&RouteType=sip",
+          body: new URLSearchParams({ From: `sip:${sipUser}`, To: CALLER_ID || numbers[0] || "", RouteType: "sip" }).toString(),
         });
         const xml = await r.text();
         if (r.ok && /<Dial[^>]*callerId="\+?\d+"[\s\S]*<Number>/.test(xml)) pass("public answer URL returns <Dial><Number>", publicUrl);
@@ -82,12 +112,14 @@ async function main() {
     }
   }
 
-  if (all || args.includes("--inbound")) {
+  if ((all || args.includes("--inbound")) && !(CALLER_ID || numbers[0])) {
+    skip("recording callback", "no caller ID: pass --caller-id or sign in to an account with a number");
+  } else if (all || args.includes("--inbound")) {
     const callUuid = `live-check-${Date.now()}`;
     try {
       const r = await fetch(`${BASE_URL}/recording-callback`, {
         method: "POST", headers: FORM,
-        body: new URLSearchParams({ CallUUID: callUuid, From: "+15550192834", To: process.env.VOBIZ_FROM_NUMBER || "+15550100000", RecordingDuration: "42" }).toString(),
+        body: new URLSearchParams({ CallUUID: callUuid, From: "+15550100055", To: CALLER_ID || numbers[0], ParentAuthID: AUTH_ID, RecordingDuration: "42" }).toString(),
       });
       const json = await r.json().catch(() => ({}));
       const activity = json.pipedriveActivity || {};
@@ -119,8 +151,8 @@ async function main() {
     }
     for (const [name, qs] of [
       ["unsigned link rejected", "recordingId=abc"],
-      ["forged signature rejected", "recordingId=abc&exp=99999999999&sig=forged"],
-      ["expired signature rejected", "recordingId=abc&exp=1&sig=deadbeef"],
+      ["forged signature rejected", "authId=x&recordingId=abc&exp=99999999999&sig=forged"],
+      ["expired signature rejected", "authId=x&recordingId=abc&exp=1&sig=deadbeef"],
     ]) {
       const r = await fetch(`${BASE_URL}/recording-file?${qs}`);
       if (r.status === 403) pass(name); else fail(name, `expected 403, got ${r.status}`);

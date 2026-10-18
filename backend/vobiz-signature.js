@@ -28,16 +28,18 @@ function equal(a, b) {
 /**
  * Returns "valid", "invalid" or "absent".
  */
-function checkSignature(headers, authToken, url) {
+function checkSignature(headers, authTokens, url) {
   const h = (name) => headers[name.toLowerCase()];
   const v3 = h("X-Vobiz-Signature-V3");
   const v3n = h("X-Vobiz-Signature-V3-Nonce");
   const v2 = h("X-Vobiz-Signature-V2");
   const v2n = h("X-Vobiz-Signature-V2-Nonce");
   if (!v3 && !v2) return "absent";
-  if (!authToken) return "invalid";
-  if (v3 && v3n && equal(v3, sign(authToken, `${url}.${v3n}`))) return "valid";
-  if (v2 && v2n && equal(v2, sign(authToken, `${url}${v2n}`))) return "valid";
+  const tokens = (Array.isArray(authTokens) ? authTokens : [authTokens]).filter(Boolean);
+  for (const authToken of tokens) {
+    if (v3 && v3n && equal(v3, sign(authToken, `${url}.${v3n}`))) return "valid";
+    if (v2 && v2n && equal(v2, sign(authToken, `${url}${v2n}`))) return "valid";
+  }
   return "invalid";
 }
 
@@ -50,14 +52,29 @@ function checkSignature(headers, authToken, url) {
  *             Vobiz does not sign every callback type on every account.
  *   off     — do not check.
  */
-function makeVerifier({ mode, authToken, publicBaseUrl }) {
+/**
+ * The key is the Auth Token of the account the callback belongs to. This
+ * backend serves many accounts, so the caller passes the candidate token(s)
+ * per request: the one account the call was routed to when it is known, or
+ * every signed-in account's token when it is not (a signature valid for any
+ * of them is accepted; one valid for none is rejected; unsigned follows the
+ * mode below).
+ */
+function makeVerifier({ mode, publicBaseUrl }) {
   const m = String(mode || "verify").toLowerCase();
   let warnedAbsent = false;
   let loggedValid = false;
-  return function verify(req, pathname) {
+  // opts.noKey: the callback belongs to a SIP-direct agent, for whom this
+  // server holds no Auth Token. A signature it cannot check is then treated
+  // like an unsigned callback (allowed in "verify", refused in "require").
+  return function verify(req, pathname, authTokens, opts = {}) {
     if (m === "off") return true;
     const url = baseUrlFor(publicBaseUrl(), pathname);
-    const result = checkSignature(req.headers || {}, authToken, url);
+    let result = checkSignature(req.headers || {}, authTokens, url);
+    if (result === "invalid" && opts.noKey) {
+      console.warn(`[signature] cannot check the signature on ${pathname}: SIP-direct call, no Auth Token held for its account`);
+      result = "absent";
+    }
     if (result === "valid") {
       if (!loggedValid) { console.log(`[signature] valid Vobiz signature on ${pathname}`); loggedValid = true; }
       return true;

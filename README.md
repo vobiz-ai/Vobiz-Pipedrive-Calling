@@ -49,9 +49,11 @@ endpoint, and it works.
 ```
 backend/
   server.js             HTTP server: webhooks, softphone API, CRM sync
+  vobiz-accounts.js     multi-account sign-in, per-account app/endpoint provisioning, webhook routing
   pipedrive-oauth.js    OAuth 2.0 — authorize, exchange, refresh, api_domain
-  test-pipedrive-sync.js  the suite. Exits non-zero on failure
-  fetch-cdr.js          CLI: pull CDRs from Vobiz and sync them
+  test-pipedrive-sync.js  live checks against a running backend. Exits non-zero on failure
+  fetch-cdr.js          CLI: pull CDRs from Vobiz and sync them (credentials as flags)
+  data/                 endpoints.json: endpoint id + SIP username per account/agent (gitignored)
   tunnel.js             cloudflared quick-tunnel helper
   static-files.js       serves agent-phone/ and pipedrive-app/ only
   vobiz-signature.js    Vobiz callback signature check (V3/V2)
@@ -77,57 +79,96 @@ fails, nothing here will work and you will debug the wrong layer for a day.
 ### 2. Start the backend and a tunnel
 
 ```bash
-cp backend/.env.example backend/.env    # fill in VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN, VOBIZ_FROM_NUMBER
+cp backend/.env.example backend/.env    # deployment config only — no Vobiz credentials
 npm start                               # :8092 by default
 cloudflared tunnel --url http://localhost:8092    # in a second terminal
 ```
 
 Put the tunnel URL in `TUNNEL_URL` in `backend/.env` and restart `npm start`.
-Vobiz must reach `/answer`, `/dial-status` and `/recording-callback` over
-public HTTPS.
+Vobiz must reach `/answer`, `/dial-status`, `/recording-callback` and
+`/hangup-callback` over public HTTPS, and sign-in points each account's
+application at `$TUNNEL_URL/answer`, so set it before anyone signs in.
 
-**Check the answer URL is alive before touching any UI.** A dead one produces
-the exact symptom people blame on registration:
+`backend/.env` holds **no** Vobiz Auth ID, Auth Token, SIP credentials or
+numbers. What stays there is deployment config: `PORT`, `TUNNEL_URL`,
+`SIGNING_SECRET`, `DATA_DIR`, `VOBIZ_WEBHOOK_SIGNATURES`, `ALLOWED_ORIGINS` and
+the Pipedrive OAuth client.
+
+### 3. Sign in — the Vobiz side sets itself up
+
+Open the softphone and sign in on the **Vobiz account** tab with your Auth ID
+and Auth Token (console.vobiz.ai → API credentials). **Any Vobiz account
+works**; several accounts can use one backend at once. On sign-in the backend:
+
+1. checks the pair with Vobiz (`GET /numbers` — anything but a 2xx is refused);
+2. finds this integration's application in your account — the one whose
+   `answer_url` is `$TUNNEL_URL/answer`, or one named `Vobiz-Pipedrive-Calling`
+   that it created earlier — or creates it. It never repoints any other
+   application;
+3. finds or creates **one SIP endpoint per agent profile** (alias
+   `pipedrive-<agent>`), binds it to that application (`{"app_id":"<id>"}`,
+   verified by reading the endpoint back, with the documented
+   `{"application": <id>}` as the fallback), and sets a **fresh random SIP
+   password**, handed only to that browser session;
+4. loads your active, voice-enabled numbers into the caller-ID picker.
+
+Only the endpoint id and SIP username are saved (`backend/data/endpoints.json`,
+mode 0600, gitignored). The Auth Token stays in server memory, keyed by Auth
+ID; it is never written to disk, logged, or sent back to the browser.
+
+**Inbound calls** are opt-in, per number: pick the number and press **Enable
+inbound calls on this number**. That attaches the DID to the integration's
+application (`POST /numbers/%2B<digits>/application`), which **moves it off
+whatever application it was on** — the panel tells you which one first.
+Incoming calls ring every signed-in agent of the account that owns the number
+(the webhook's `ParentAuthID`, or the dialled number when that is absent).
+
+**Check the answer URL is alive before relying on calls.** A dead one produces
+the exact symptom people blame on registration. An unknown SIP user gets a
+polite `<Hangup/>`; that still proves the URL is reachable:
 
 ```bash
-curl -s -X POST "$TUNNEL_URL/answer" \
-  -d "From=sip:x@registrar.vobiz.ai&To=91XXXXXXXXXX&RouteType=sip"
+curl -s -X POST "$TUNNEL_URL/answer" -d "From=sip:check@registrar.vobiz.ai&To=10000000000&RouteType=sip"
 ```
 
-You must get `<Response>` containing `<Dial …><Number>`. Anything else — an
-ngrok interstitial, a 404 page — and every call dies.
+You must get a `<Response>`. An ngrok interstitial or a 404 page means every
+call will die.
 
-### 3. Create the Vobiz application, endpoint and number routing
+#### SIP direct (no account credentials)
 
-```bash
-export AUTH_ID=MA_XXXXXXXX AUTH_TOKEN=... TUNNEL_URL=https://....trycloudflare.com
-H=(-H "X-Auth-ID: $AUTH_ID" -H "X-Auth-Token: $AUTH_TOKEN" -H "Content-Type: application/json")
-API=https://api.vobiz.ai/api/v1/Account/$AUTH_ID
+The **SIP direct** tab registers with an *existing* endpoint's SIP username and
+password plus a caller ID you type (E.164, e.g. `+<country code><number>`). The
+password stays in the browser; the backend only records "this SIP user calls out
+as, and receives calls on, this number" so it can route that endpoint's
+webhooks. Recordings, the number list, CRM lookups and *Enable inbound calls*
+need a Vobiz account sign-in and are unavailable in this mode.
 
-# 1. the application: answer_url and hangup_url both point at /answer
-curl -s -X POST "$API/Application/" "${H[@]}" -d '{
-  "app_name":"Pipedrive Calling",
-  "answer_url":"'"$TUNNEL_URL"'/answer","answer_method":"POST",
-  "hangup_url":"'"$TUNNEL_URL"'/answer","hangup_method":"POST"}'
-# -> note "app_id"
+Because the backend holds no credentials for that account, **you** bind the
+endpoint and the number to an application whose answer URL is this backend:
 
-# 2. the SIP endpoint the softphone registers as, bound to that application
-curl -s -X POST "$API/Endpoint/" "${H[@]}" -d '{
-  "username":"pdagent01","password":"<choose a strong one>",
-  "alias":"Pipedrive_Agent","application":<APP_ID>}'
-# -> note "endpoint_id" and "sip_uri"
+- **Console:** Voice → Applications → create one with Answer URL
+  `$TUNNEL_URL/answer` (POST) and Hangup URL `$TUNNEL_URL/hangup-callback`
+  (POST). Voice → Endpoints → your endpoint → set *Application* to it. Phone
+  Numbers → your number → set *Application* to it.
+- **API equivalent:**
 
-# 3. confirm the binding: application.app_id must be your APP_ID
-curl -s "$API/Endpoint/<ENDPOINT_ID>/" "${H[@]}"
+  ```bash
+  H=(-H "X-Auth-ID: $AUTH_ID" -H "X-Auth-Token: $AUTH_TOKEN" -H "Content-Type: application/json")
+  API=https://api.vobiz.ai/api/v1/Account/$AUTH_ID
+  curl -s -X POST "$API/Application/" "${H[@]}" -d '{"app_name":"Vobiz-Pipedrive-Calling",
+    "answer_url":"'"$TUNNEL_URL"'/answer","answer_method":"POST",
+    "hangup_url":"'"$TUNNEL_URL"'/hangup-callback","hangup_method":"POST"}'      # -> app_id
+  curl -s -X POST "$API/Endpoint/<ENDPOINT_ID>/" "${H[@]}" -d '{"app_id":"<APP_ID>"}'
+  curl -s "$API/Endpoint/<ENDPOINT_ID>/" "${H[@]}"     # application.app_id must be <APP_ID>
+  curl -s -X POST "$API/numbers/%2B<DIGITS>/application" "${H[@]}" -d '{"application_id":"<APP_ID>"}'
+  ```
 
-# 4. route a DID to the application for inbound (lowercase /numbers, + as %2B)
-curl -s -X POST "$API/numbers/%2B91XXXXXXXXXX/application" "${H[@]}" \
-  -d '{"application_id":"<APP_ID>"}'
-```
+  Keep `app_id` as a string: it is 17 digits, beyond what a JavaScript number
+  holds exactly.
 
-Put the user part of the returned `sip_uri` in `VOBIZ_SIP_USER` and the
-password in `VOBIZ_SIP_PASSWORD`. Use the `sip_uri` Vobiz returns, not the
-name you typed. Usernames are alphanumeric only.
+A SIP-direct call's webhook signature cannot be checked (no Auth Token is held
+for its account), so it is treated as unsigned: accepted under the default
+`VOBIZ_WEBHOOK_SIGNATURES=verify`, refused under `require`.
 
 ### 4. Connect Pipedrive over OAuth
 
@@ -152,7 +193,9 @@ to the softphone and `POST /auth/pipedrive/disconnect` first.
 
 ### 5. Turn on strict webhook signatures
 
-Make one call, then look for `[signature] valid Vobiz signature on /answer` in
+Each callback is checked with the Auth Token of the account it belongs to
+(found from the call, the SIP user, `ParentAuthID` or the dialled number). Make
+one call, then look for `[signature] valid Vobiz signature on /answer` in
 the backend log. Once you see it, set `VOBIZ_WEBHOOK_SIGNATURES=require` so
 unsigned requests to the webhook routes are rejected. The default (`verify`)
 rejects a wrong signature but lets an unsigned callback through, because Vobiz
@@ -160,37 +203,42 @@ does not sign every callback type on every account.
 
 ## Using it
 
-Open **`http://localhost:8092/`**, sign in with the Vobiz Auth ID and Auth
-Token **of the account this server is configured for**, and allow the
-microphone. Any other credentials are refused.
+Open **`http://localhost:8092/`**, sign in with **your** Vobiz Auth ID and Auth
+Token (any account) or on the SIP direct tab, and allow the microphone.
 
 Wait for the status to read **Ready**. That is JsSIP registering. The Call
 button is disabled until then, deliberately: dialling with SIP down rings the
 customer into silence.
 
-- **Outbound** — pick the caller ID, type a number, hit Call.
-- **Inbound** — call the DID you routed in step 3. **Enter** accepts,
-  **Escape** declines.
+- **Outbound** — pick the caller ID (only your account's active, voice-enabled
+  numbers are offered, and the backend refuses any other), type a number, hit
+  Call.
+- **Inbound** — after *Enable inbound calls* on a number, call it. **Enter**
+  accepts, **Escape** declines.
 - After a call, the recording callback writes a Pipedrive **Activity** and a
   **Call Log** with the recording attached.
 
-The *SIP direct* tab registers with an endpoint's own SIP credentials and can
-call, but has no backend session, so CRM lookups and the recordings list need
-an account sign-in.
+Signing in again rotates the endpoint's SIP password, so a second browser
+signed in as the same agent profile loses its registration. Give each person
+their own agent profile (`backend/agents.json`, see `agents.example.json`).
 
 ## Testing
 
 ```bash
 npm test                   # offline: boots the server against fakes, no credentials, no network
-npm run test:live          # against a running `npm start` and your real services
+# live checks take the account at runtime, never from .env:
+AUTH_ID=... AUTH_TOKEN=... npm run test:live      # against a running `npm start` and your real services
 npm run test:answer        # just: does the public answer URL return <Dial><Number>?
 npm run test:inbound       # writes ONE test Activity + Call Log to the connected Pipedrive
 npm run test:recording     # recording-proxy regression checks
 npm run test:sync          # CDR backfill
 ```
 
-`npm test` covers path traversal, sign-in, session gating, CORS, the answer
-XML in both directions, webhook signatures and the exact Pipedrive payloads.
+`npm test` covers path traversal, sign-in for two different accounts at once,
+provisioning (including the exact 17-digit bind body), per-account webhook
+routing in both directions, SIP direct, per-account webhook signatures,
+account-scoped recording links, that the Auth Token never appears in a
+response, session gating, CORS and the exact Pipedrive payloads.
 The live checks report **PASS / FAIL / SKIP** and exit non-zero on failure.
 SKIP means a service is not configured. It is not a pass.
 
@@ -207,12 +255,14 @@ it connected; empty means no B leg was ever created, whatever the UI showed.
 
 | Symptom | Cause |
 |---|---|
-| No `[/answer]` line at all | Endpoint not bound to the application, or `TUNNEL_URL` is stale |
+| No `[/answer]` line at all | Endpoint not bound to the application (look for `NOT bound` in the sign-in log), or `TUNNEL_URL` is stale — sign in again after fixing it |
+| `outbound from unknown SIP user` | The backend restarted (sign-ins are in memory) — sign in again |
+| `no signed-in agent for this account or number` | Nobody from the account that owns the dialled number is signed in |
 | `bleg=(none…)` | Destination unreachable, or the caller ID is not owned by this account |
 | No CDR in Vobiz at all | `422 Session Interval Too Small` — a session-timer problem |
 | CDR billed `0s` | SDP/ICE — check STUN candidates in the browser console |
 | Panel stuck on "Connecting…" | Backend unreachable, or it crashed — check the log |
-| "Registration failed" | Wrong `VOBIZ_SIP_USER` / `VOBIZ_SIP_PASSWORD` — use the user part of the `sip_uri` Vobiz returned |
+| "Registration failed" | Account mode: the same agent profile signed in elsewhere and rotated the password — sign in again. SIP direct: wrong username/password — use the user part of the endpoint's `sip_uri` |
 | `[signature] INVALID` in the log | `TUNNEL_URL` does not match the URL Vobiz is calling — update it and the application's `answer_url` |
 | Caller hears ringback then the fallback | `<Dial><User>` naming an endpoint that is not registered |
 
@@ -232,16 +282,21 @@ gates on JsSIP's `registered` event instead.
 **Quick tunnels are the most common cause of "it stopped working."** The
 hostname changes on every restart, and three things go stale together:
 `TUNNEL_URL`, the Vobiz application's `answer_url`, and the Pipedrive OAuth
-callback. Use a stable hostname for anything beyond a demo.
+callback. Signing in again repoints the integration's own application; the
+Pipedrive callback you update by hand. Use a stable hostname for anything
+beyond a demo.
 
 ## Known limitations
 
-- **Single account, single endpoint.** One install signs in with one Vobiz
-  account and registers one SIP endpoint. Two agents on one install register as
-  the same endpoint and race for calls.
-- **Single-tenant token storage.** OAuth tokens live in
-  `backend/.pipedrive-tokens.json` (mode 0600, gitignored). Multi-tenant
-  operation needs a database with encryption at rest.
+- **Sign-ins live in memory.** After a backend restart every agent signs in
+  again. Until someone from an account does, that account's calls are hung up
+  politely and its signed recording links return "sign in again" (HTTP 409).
+- **One endpoint per agent profile.** Two people using the same profile share
+  one endpoint, and each sign-in rotates its password.
+- **One Pipedrive company per install.** Any number of Vobiz accounts can sign
+  in, but OAuth tokens for a single Pipedrive company live in
+  `backend/.pipedrive-tokens.json` (mode 0600, gitignored), and every account's
+  calls are logged there.
 - **Calls are logged when the recording is ready.** The Activity and Call Log
   are written from the recording callback, so an unanswered call (no
   recording) is not logged. `npm run fetch-cdr` backfills from CDRs, and does
