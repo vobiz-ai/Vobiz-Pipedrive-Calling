@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- README rewritten as a customer setup and operations guide: Pipedrive app
+  and scopes, both sign-in modes, inbound, what is logged, configuration
+  reference, production checklist, troubleshooting and limitations.
+
 ### Changed — any Vobiz account can sign in
 
 - Sign-in accepts any Vobiz account: the Auth ID and Auth Token are verified
@@ -40,9 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `backend/.env`, the OAuth token store and the source tree were readable over
   HTTP (`GET /backend/.env`, `GET /../backend/.env`). Static files are now
   served from `agent-phone/` and `pipedrive-app/` only.
-- Sign-in accepted the configured Auth ID with any token, and any valid pair
-  for another Vobiz account; either way the session received the SIP password.
-  Sign-in now requires this server's exact credentials.
+- Sign-in accepted the configured Auth ID with any token. Sign-in is now
+  verified with Vobiz itself.
 - Routes that place calls, read recordings, read CRM data or write to the CRM
   now require a session. `/start-call` (unauthenticated REST origination) and
   `/transfer-call` (reported success, did nothing) are removed.

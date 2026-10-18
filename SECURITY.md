@@ -32,10 +32,9 @@ server-side with that account's credentials. A link that leaks grants nothing
 but that one recording, only until it expires, and can never be re-pointed at
 another account's audio.
 
-**Recording playback takes no caller-supplied URL.** An earlier generation of
-this pattern accepted a `url` parameter and fetched it with the account's Vobiz
-credentials attached — a credential-exfiltration primitive any web page could
-drive. Never reintroduce one.
+**Recording playback takes no caller-supplied URL.** The backend resolves
+the audio location through the Vobiz API and fetches only from Vobiz media
+hosts.
 
 **CORS is an allowlist**, not `*`.
 
@@ -79,6 +78,10 @@ identity, and nothing stops a signed-in user from asserting another.
 
 **Deployment secrets live in `.env`** (signing secret, Pipedrive client). There
 is no secret manager and no encryption at rest. Treat the host as sensitive.
+
+**The first Pipedrive connection is open.** Until a Pipedrive company is
+connected, anyone who can reach `/auth/pipedrive` can connect one. Connect
+yours right after deploying. Changing it afterwards needs a signed-in session.
 
 **A quick tunnel is not production infrastructure.** Its hostname changes on
 every restart and it is publicly reachable while it is up.
