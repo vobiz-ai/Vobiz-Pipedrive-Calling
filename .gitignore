@@ -8,3 +8,5 @@ zoho-orgs.json
 agents.json
 dist/
 tunnel-url.txt
+backend/data/
+data/

@@ -22,7 +22,7 @@
         </div>
         <span class="call-done-badge">Inbound Call Completed</span>
         <h3 class="call-done-title">Call Finished</h3>
-        <p id="inboundDoneCaller" class="call-done-caller">+91 00000 00000</p>
+        <p id="inboundDoneCaller" class="call-done-caller">Inbound call</p>
         
         <div class="call-done-stats">
           <div class="call-done-stat-item">
@@ -110,9 +110,10 @@
           <!-- Tab 1: Vobiz Account Mode -->
           <div id="mode-account" role="tabpanel" aria-labelledby="mode-account-tab">
             <p class="step-help">
-              Your Auth ID and Auth Token are on the
+              Any Vobiz account works. Your Auth ID and Auth Token are on the
               <a href="https://console.vobiz.ai" target="_blank" rel="noopener">Console dashboard</a>,
               under <strong>API credentials</strong>. The Auth Token is not your login password.
+              Signing in sets up this softphone's SIP endpoint in your account for you.
             </p>
 
             <div id="vobiz-login-form">
@@ -151,6 +152,9 @@
               The endpoint's own SIP credentials, from
               <a href="https://console.vobiz.ai" target="_blank" rel="noopener">Console</a> &rarr;
               Voice &rarr; Endpoints. Signs in as that one endpoint, without account-wide credentials.
+              The endpoint and your number must be attached to a Vobiz application whose answer URL
+              is this backend's <code>/answer</code>. Recordings, the number list and
+              "Enable inbound calls" need a Vobiz account sign-in.
             </p>
 
             <div class="form-group">
@@ -165,7 +169,7 @@
 
             <div class="form-group">
               <label class="field-label" for="sip-caller-id">Calling From (Caller ID)</label>
-              <input type="tel" id="sip-caller-id" class="input input-mono" placeholder="+91XXXXXXXXXX" autocomplete="off" />
+              <input type="tel" id="sip-caller-id" class="input input-mono" placeholder="+ country code and number" autocomplete="off" />
               <p class="hint">
                 The number outgoing calls show. Carriers reject a call without a real one.
               </p>
@@ -208,6 +212,12 @@
           <div class="form-group">
             <select id="vobiz-number-select" class="input"></select>
           </div>
+          <button id="enable-inbound-btn" class="btn" type="button" disabled>Enable inbound calls on this number</button>
+          <p class="hint">
+            Routes calls to the selected number to this softphone. It moves the number off any
+            other Vobiz application it is attached to.
+          </p>
+          <p id="inbound-status" class="hint"></p>
         </section>
 
         <!-- Step 3 — Place a Call -->
@@ -219,13 +229,13 @@
             </div>
           </div>
           <p class="step-help">
-            Type a phone number in E.164 format (e.g. +91 98765 43210) to dial.
+            Type a phone number in E.164 format, country code first (a leading +, then digits) to dial.
           </p>
 
           <div id="dialbox">
             <div class="form-group">
               <label class="field-label" for="dialnumber">Number to call</label>
-              <input type="tel" id="dialnumber" class="input input-mono input-dial" placeholder="+91 98765 43210" autocomplete="off" />
+              <input type="tel" id="dialnumber" class="input input-mono input-dial" placeholder="+ country code and number" autocomplete="off" />
             </div>
 
             <!-- Dialpad Keypad Grid -->

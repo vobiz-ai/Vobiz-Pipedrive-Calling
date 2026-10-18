@@ -1,103 +1,80 @@
-// CLI Tool to fetch live Vobiz CDRs and Call Recordings and sync them to Pipedrive
-// Usage: node backend/fetch-cdr.js [--sync]
+// Dev tool: list a Vobiz account's recent CDRs and recordings, and optionally
+// ask a running backend to sync them to Pipedrive.
+//
+// Usage:
+//   node backend/fetch-cdr.js --auth-id <AUTH_ID> --auth-token <AUTH_TOKEN> [--sync] [--port 8092]
+//   AUTH_ID=... AUTH_TOKEN=... node backend/fetch-cdr.js [--sync]
+//
+// Credentials are taken at runtime only, from the flags or the AUTH_ID /
+// AUTH_TOKEN environment variables. Nothing is read from backend/.env and
+// there are no defaults: without both values the script stops.
 
-const fs = require("fs");
-const path = require("path");
-
-try {
-  process.loadEnvFile(path.join(__dirname, ".env"));
-} catch (e) {
-  const envPath = path.join(__dirname, ".env");
-  if (fs.existsSync(envPath)) {
-    const lines = fs.readFileSync(envPath, "utf8").split("\n");
-    for (const line of lines) {
-      const idx = line.indexOf("=");
-      if (idx !== -1 && !line.trim().startsWith("#")) {
-        const key = line.slice(0, idx).trim();
-        const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
-        if (key) process.env[key] = val;
-      }
-    }
-  }
+function arg(name) {
+  const i = process.argv.indexOf(name);
+  return i !== -1 && process.argv[i + 1] && !process.argv[i + 1].startsWith("--") ? process.argv[i + 1] : "";
 }
 
-const { VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN, VOBIZ_API_URL = "https://api.vobiz.ai", PORT = 8092 } = process.env;
+const AUTH_ID = arg("--auth-id") || process.env.AUTH_ID || "";
+const AUTH_TOKEN = arg("--auth-token") || process.env.AUTH_TOKEN || "";
+const API_URL = arg("--api-url") || process.env.VOBIZ_API_URL || "https://api.vobiz.ai";
+const PORT = arg("--port") || process.env.PORT || "8092";
 
 async function main() {
-  console.log(`\n==================================================`);
-  console.log(`📡 Fetching Vobiz CDRs & Recordings for ${VOBIZ_AUTH_ID || "Account"}`);
-  console.log(`==================================================`);
-
-  if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN || VOBIZ_AUTH_ID.includes("YOUR_")) {
-    console.error("❌ Vobiz API credentials (VOBIZ_AUTH_ID / VOBIZ_AUTH_TOKEN) not configured in backend/.env");
-    console.log("ℹ️  Running in demonstration mode.");
+  if (!AUTH_ID || !AUTH_TOKEN) {
+    console.error("Usage: node backend/fetch-cdr.js --auth-id <AUTH_ID> --auth-token <AUTH_TOKEN> [--sync]");
+    console.error("       (or set AUTH_ID and AUTH_TOKEN in the environment)");
+    process.exitCode = 2;
+    return;
   }
 
-  const headers = {
-    "X-Auth-ID": VOBIZ_AUTH_ID || "",
-    "X-Auth-Token": VOBIZ_AUTH_TOKEN || ""
-  };
+  const headers = { "X-Auth-ID": AUTH_ID, "X-Auth-Token": AUTH_TOKEN };
+  const account = encodeURIComponent(AUTH_ID);
+  console.log(`\nFetching Vobiz CDRs and recordings for ${AUTH_ID}\n`);
 
-  console.log(`\n--- Most Recent CDRs (Call Detail Records) ---`);
+  console.log("--- Most recent CDRs ---");
   try {
-    if (VOBIZ_AUTH_ID && !VOBIZ_AUTH_ID.includes("YOUR_")) {
-      const cdrRes = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/cdr/recent?limit=5`, { headers });
-      const cdrJson = await cdrRes.json();
-      if (!cdrRes.ok) {
-        console.error("❌ CDR fetch failed:", cdrRes.status, cdrJson);
-      } else {
-        const cdrs = cdrJson.data || [];
-        for (const c of cdrs) {
-          console.log(
-            `- ${c.start_time || "Now"} | ${(c.call_direction || "outbound").padEnd(8)} | ${c.caller_id_number} -> ${c.destination_number} | ` +
-            `duration=${c.duration}s | hangup=${c.hangup_cause} | uuid=${c.uuid}`
-          );
-        }
-        if (cdrs.length === 0) {
-          console.log("(No CDRs found. Note: CDRs appear a few seconds after a call completes)");
-        }
-      }
+    const cdrRes = await fetch(`${API_URL}/api/v1/Account/${account}/cdr/recent?limit=5`, { headers });
+    const cdrJson = await cdrRes.json().catch(() => ({}));
+    if (!cdrRes.ok) {
+      console.error("CDR fetch failed:", cdrRes.status, cdrJson);
     } else {
-      console.log("- [Mock CDR] 2026-09-02T12:00:00Z | outbound | +15550100000 -> +15550192834 | duration=45s | hangup=NORMAL_CLEARING | uuid=mock-cdr-101");
+      const cdrs = cdrJson.data || [];
+      for (const c of cdrs) {
+        console.log(
+          `- ${c.start_time || "?"} | ${(c.call_direction || "?").padEnd(8)} | ${c.caller_id_number} -> ${c.destination_number} | ` +
+          `duration=${c.duration}s | hangup=${c.hangup_cause} | uuid=${c.uuid}`
+        );
+      }
+      if (cdrs.length === 0) console.log("(No CDRs. They appear a few seconds after a call completes.)");
     }
   } catch (err) {
-    console.error("❌ CDR fetch network error:", err.message);
+    console.error("CDR fetch network error:", err.message);
   }
 
-  console.log(`\n--- Most Recent Call Recordings ---`);
+  console.log("\n--- Most recent recordings ---");
   try {
-    if (VOBIZ_AUTH_ID && !VOBIZ_AUTH_ID.includes("YOUR_")) {
-      const recRes = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Recording/?limit=5`, { headers });
-      const recJson = await recRes.json();
-      if (!recRes.ok) {
-        console.error("❌ Recording fetch failed:", recRes.status, recJson);
-      } else {
-        const list = recJson.data || recJson.recordings || [];
-        for (const r of list) {
-          console.log(`- UUID: ${r.call_uuid || r.uuid || "N/A"} | URL: ${r.record_url || r.recording_url || r.url || "N/A"}`);
-        }
-        if (list.length === 0) {
-          console.log("(No recordings found)");
-        }
-      }
+    const recRes = await fetch(`${API_URL}/api/v1/Account/${account}/Recording/?limit=5`, { headers });
+    const recJson = await recRes.json().catch(() => ({}));
+    if (!recRes.ok) {
+      console.error("Recording fetch failed:", recRes.status, recJson);
     } else {
-      console.log("- [Mock Recording] UUID: mock-cdr-101 | URL: https://media.vobiz.ai/v1/recording/mock-recording-101.mp3");
+      const list = recJson.objects || recJson.data || [];
+      for (const r of list) console.log(`- ${r.recording_id || "?"} | call ${r.call_uuid || "?"} | ${r.add_time || ""}`);
+      if (list.length === 0) console.log("(No recordings)");
     }
   } catch (err) {
-    console.error("❌ Recording fetch network error:", err.message);
+    console.error("Recording fetch network error:", err.message);
   }
 
   if (process.argv.includes("--sync")) {
-    console.log(`\n==================================================`);
-    console.log(`🔄 Triggering Pipedrive CDR & Recording Synchronization`);
-    console.log(`==================================================`);
+    console.log("\n--- Syncing recent CDRs to Pipedrive via the running backend ---");
     try {
-      // /sync-recent-cdrs writes to the CRM, so it needs a session like any
-      // other caller. Sign in with the same credentials the server holds.
+      // /sync-recent-cdrs writes to the CRM, so it needs a session. Signing in
+      // also provisions this account's application and endpoint if needed.
       const login = await fetch(`http://localhost:${PORT}/api/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ authId: VOBIZ_AUTH_ID, authToken: VOBIZ_AUTH_TOKEN }),
+        body: JSON.stringify({ authId: AUTH_ID, authToken: AUTH_TOKEN }),
       });
       const session = await login.json().catch(() => ({}));
       if (!login.ok || !session.token) throw new Error(`sign-in failed: ${session.error || login.status}`);
@@ -105,12 +82,11 @@ async function main() {
         method: "POST",
         headers: { Authorization: `Bearer ${session.token}` },
       });
-      const syncJson = await res.json();
-      console.log(JSON.stringify(syncJson, null, 2));
+      console.log(JSON.stringify(await res.json(), null, 2));
     } catch (err) {
-      console.error("❌ Sync trigger failed (Is 'npm start' running on port " + PORT + "?):", err.message);
+      console.error(`Sync failed (is 'npm start' running on port ${PORT}?):`, err.message);
     }
   }
 }
 
-main().catch((err) => console.error("fetch-cdr error:", err));
+main().catch((err) => { console.error("fetch-cdr error:", err); process.exitCode = 1; });

@@ -19,6 +19,8 @@ test("static file server never leaves agent-phone/ or pipedrive-app/", async (t)
     "/backend/server.js",
     "/backend/.pipedrive-tokens.json",
     "/backend/agents.json",
+    "/backend/data/endpoints.json",
+    "/data/endpoints.json",
     "/package.json",
     "/.git/config",
     "/.gitignore",

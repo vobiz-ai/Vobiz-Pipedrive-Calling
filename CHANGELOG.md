@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — any Vobiz account can sign in
+
+- Sign-in accepts any Vobiz account: the Auth ID and Auth Token are verified
+  with Vobiz (`GET /numbers`), not compared with values in `.env`. Several
+  accounts can use one backend at once.
+- Per sign-in provisioning: this integration's application is found (by
+  `answer_url`, or its own name) or created in that account, and one SIP
+  endpoint per (account, agent profile) is found (by alias) or created, bound
+  with `{"app_id":"<id>"}` (verified by GET; documented integer form as the
+  fallback), and given a fresh random SIP password. Endpoint ids and usernames
+  are kept in `backend/data/endpoints.json` (0600, gitignored); no passwords or
+  tokens.
+- "Enable inbound calls" attaches a number to the integration's application,
+  only when asked.
+- Webhooks are routed per account: outbound by SIP user, inbound by
+  `ParentAuthID` (dialled number as fallback), ringing every signed-in agent of
+  that account. Unknown calls get a polite hangup.
+- Caller IDs come from the account's active, voice-enabled numbers; anything
+  else is refused.
+- Webhook signatures are checked with the owning account's Auth Token.
+- Recording links include the Auth ID in the signed payload.
+- SIP direct (typed endpoint credentials + caller ID) works with no account
+  credentials on the server.
+- Removed `VOBIZ_AUTH_ID`, `VOBIZ_AUTH_TOKEN`, `VOBIZ_FROM_NUMBER`,
+  `VOBIZ_SIP_USER` and `VOBIZ_SIP_PASSWORD`. `fetch-cdr.js` and the live checks
+  take the account as flags (`--auth-id`, `--auth-token`) or `AUTH_ID` /
+  `AUTH_TOKEN` at runtime.
+
 ### Security
 
 - `backend/.env`, the OAuth token store and the source tree were readable over

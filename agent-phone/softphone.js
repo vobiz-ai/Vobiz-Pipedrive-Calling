@@ -2,8 +2,11 @@
  *
  * Supports:
  * 1. Dual login:
- *    - Mode 1: Vobiz account (Auth ID & Auth Token)
- *    - Mode 2: SIP direct (SIP username, SIP password & Outbound Caller ID)
+ *    - Mode 1: Vobiz account (Auth ID & Auth Token, any account). The backend
+ *      sets up this agent's SIP endpoint in that account.
+ *    - Mode 2: SIP direct (an existing endpoint's SIP username + password and a
+ *      caller ID). No account API access: recordings, the number list and
+ *      "Enable inbound calls" need a Vobiz account sign-in.
  * 2. Incoming call banner with Web Audio ringtone & Accept/Decline keyboard shortcuts.
  * 3. Inbound call completed notification popup modal + native HTML5 desktop notification.
  * 4. Outbound calling with custom caller ID headers, keypad, live timer, mute, hold.
@@ -55,6 +58,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Step 2 & 3: Caller ID & Dialer
   const numberSelect = document.getElementById("vobiz-number-select");
+  const enableInboundBtn = document.getElementById("enable-inbound-btn");
+  const inboundStatus = document.getElementById("inbound-status");
   const dialInput = document.getElementById("dialnumber");
   const dialBtn = document.getElementById("dialbtn");
   const hangupBtn = document.getElementById("hangupbtn");
@@ -74,6 +79,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const pdContactOrg = document.getElementById("pdContactOrg");
   const pdDealTag = document.getElementById("pdDealTag");
   const refreshContactBtn = document.getElementById("refreshContactBtn");
+  const contactHint = document.getElementById("dial-hint");
 
   // History & Activity Log
   const historyList = document.getElementById("call-history-list");
@@ -86,6 +92,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const AUTH_MODE_KEY = "vobiz_pipedrive_auth_mode";
   const SIP_CREDS_KEY = "vobiz_pipedrive_sip_creds";
   const SESSION_KEY = "vobiz_pipedrive_session";
+  const SIP_CLAIM_KEY = "vobiz_pipedrive_sip_claim";
 
   let authMode = "account"; // "account" | "sip"
 
@@ -162,6 +169,9 @@ document.addEventListener("DOMContentLoaded", () => {
     if (dialBtn) dialBtn.disabled = !canDial;
     if (dialInput) dialInput.disabled = !accountReady;
     if (numberSelect) numberSelect.disabled = !accountReady;
+    if (enableInboundBtn) {
+      enableInboundBtn.disabled = authMode !== "account" || !accountReady || !(numberSelect && numberSelect.value);
+    }
 
     if (!accountReady) {
       if (dialHint) dialHint.textContent = "Sign in to activate the dialer.";
@@ -469,7 +479,7 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    setLoginStatus("Signing in to Vobiz…");
+    setLoginStatus("Signing in to Vobiz and setting up your SIP endpoint…");
     setStatus("Authenticating…", "pending");
     if (accountLoginBtn) accountLoginBtn.disabled = true;
 
@@ -488,6 +498,8 @@ document.addEventListener("DOMContentLoaded", () => {
           agentId: data.agent.id,
           agentName: data.agent.name,
           numbers: data.numbers || [],
+          numberDetails: data.numberDetails || [],
+          applicationId: data.applicationId || "",
           selected: data.selected || ""
         }));
 
@@ -550,6 +562,28 @@ document.addEventListener("DOMContentLoaded", () => {
     setLoginStatus(`Connecting as ${cleanUsername}…`);
     setStatus(`Connecting as ${cleanUsername}…`, "pending");
 
+    // Tell the backend which caller ID (and inbound number) belongs to this
+    // SIP user, so its webhooks can route this endpoint's calls. The SIP
+    // password never leaves the browser.
+    try {
+      const res = await fetch("/api/sip-direct", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sipUser: cleanUsername, callerId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        setLoginStatus(`Could not connect: ${data.error || `HTTP ${res.status}`}`);
+        setStatus("Connect failed", "error");
+        return;
+      }
+      sessionStorage.setItem(SIP_CLAIM_KEY, JSON.stringify({ sipUser: cleanUsername, claimToken: data.claimToken }));
+    } catch (err) {
+      setLoginStatus(`Network error: ${err.message}`);
+      setStatus("Offline", "error");
+      return;
+    }
+
     // The caller ID travels with each call as an X-VH-Caller-ID SIP header,
     // so the backend needs no per-user state for it.
     accountReady = true;
@@ -566,9 +600,23 @@ document.addEventListener("DOMContentLoaded", () => {
 
     log(`SIP direct connecting for endpoint: ${cleanUsername} with Caller ID: ${callerId}`, "info");
     loadCallRecordings();
+    if (contactHint) contactHint.textContent = "Sign in with your Vobiz account to use Pipedrive contact lookup and recordings.";
   }
 
   function handleLogout() {
+    const headers = authHeaders();
+    if (headers.Authorization) fetch("/api/logout", { method: "POST", headers }).catch(() => {});
+    try {
+      const claim = JSON.parse(sessionStorage.getItem(SIP_CLAIM_KEY) || "null");
+      if (claim && claim.claimToken) {
+        fetch("/api/sip-direct/release", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(claim),
+        }).catch(() => {});
+      }
+    } catch { /* ignore */ }
+    sessionStorage.removeItem(SIP_CLAIM_KEY);
     sessionStorage.removeItem(SESSION_KEY);
     localStorage.removeItem(SIP_CREDS_KEY);
     accountReady = false;
@@ -641,6 +689,23 @@ document.addEventListener("DOMContentLoaded", () => {
       if (num === selected) opt.selected = true;
       numberSelect.appendChild(opt);
     });
+    refreshInboundBadge();
+  }
+
+  // Which Vobiz application the selected number's inbound calls go to now.
+  function refreshInboundBadge() {
+    if (!inboundStatus || !numberSelect) return;
+    try {
+      const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+      if (!s || !s.token) { inboundStatus.textContent = ""; return; }
+      const d = (s.numberDetails || []).find((n) => n.e164 === numberSelect.value);
+      if (!d) { inboundStatus.textContent = ""; return; }
+      inboundStatus.textContent = !d.applicationId
+        ? "Inbound: not attached to any application."
+        : d.applicationId === s.applicationId
+          ? "Inbound: rings this softphone."
+          : `Inbound: currently goes to Vobiz application ${d.applicationId}.`;
+    } catch { /* ignore */ }
   }
 
   // ─── Outbound Calling ─────────────────────────────────────────────────────
@@ -650,6 +715,82 @@ document.addEventListener("DOMContentLoaded", () => {
       return (sipCallerIdInput && sipCallerIdInput.value.trim()) || "";
     }
     return (numberSelect && numberSelect.value) || "";
+  }
+
+  // The backend routes outbound calls by this choice too; tell it.
+  if (numberSelect) {
+    numberSelect.addEventListener("change", async () => {
+      const number = numberSelect.value;
+      updateDialButtonState();
+      if (!number || !authHeaders().Authorization) return;
+      try {
+        const res = await fetch("/api/caller-id", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ number }),
+        });
+        if (res.ok) {
+          const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+          if (s) { s.selected = number; sessionStorage.setItem(SESSION_KEY, JSON.stringify(s)); }
+          refreshInboundBadge();
+          log(`Caller ID set to ${number}`, "info");
+        } else {
+          log(`Could not set caller ID ${number}`, "error");
+        }
+      } catch (e) { /* ignore */ }
+    });
+  }
+
+  // Explicit, per number: point the DID at this integration's application.
+  if (enableInboundBtn) {
+    enableInboundBtn.addEventListener("click", async () => {
+      const number = numberSelect ? numberSelect.value : "";
+      if (!number) return;
+      if (!authHeaders().Authorization) {
+        if (inboundStatus) inboundStatus.textContent = "Sign in with your Vobiz account to use this.";
+        return;
+      }
+      let current = "";
+      let ours = "";
+      try {
+        const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null") || {};
+        const d = (s.numberDetails || []).find((n) => n.e164 === number);
+        current = d ? d.applicationId : "";
+        ours = s.applicationId || "";
+      } catch { /* ignore */ }
+      if (current && current === ours) {
+        if (inboundStatus) inboundStatus.textContent = `Inbound calls to ${number} already ring this softphone.`;
+        return;
+      }
+      const moving = current ? `It is currently attached to Vobiz application ${current}; it will be moved off it.` : "It is not attached to any Vobiz application yet.";
+      if (!window.confirm(`Route inbound calls to ${number} to this softphone? ${moving}`)) return;
+      enableInboundBtn.disabled = true;
+      if (inboundStatus) inboundStatus.textContent = `Enabling inbound calls on ${number}…`;
+      try {
+        const res = await fetch("/api/inbound/enable", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ number }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (inboundStatus) {
+          inboundStatus.textContent = res.ok && data.success
+            ? `Inbound calls to ${data.number} now ring this softphone${data.previousApplicationId ? ` (moved from application ${data.previousApplicationId})` : ""}.`
+            : `Could not enable inbound calls: ${data.error || `HTTP ${res.status}`}`;
+        }
+        if (res.ok && data.success) {
+          try {
+            const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+            const d = s && (s.numberDetails || []).find((n) => n.e164 === data.number);
+            if (d) { d.applicationId = data.applicationId; sessionStorage.setItem(SESSION_KEY, JSON.stringify(s)); }
+          } catch { /* ignore */ }
+        }
+      } catch (err) {
+        if (inboundStatus) inboundStatus.textContent = `Could not enable inbound calls: ${err.message}`;
+      } finally {
+        updateDialButtonState();
+      }
+    });
   }
 
   async function placeCall() {
@@ -764,7 +905,8 @@ document.addEventListener("DOMContentLoaded", () => {
   // ─── Pipedrive Contact Lookup ─────────────────────────────────────────────
 
   async function lookupPipedriveContact(phone) {
-    if (!phone || phone.length < 5) {
+    // CRM lookups need an account session; SIP direct has none.
+    if (!authHeaders().Authorization || !phone || phone.length < 5) {
       if (contactBox) contactBox.classList.add("hidden");
       return;
     }
