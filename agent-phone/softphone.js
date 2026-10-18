@@ -247,7 +247,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if ("Notification" in window && Notification.permission === "granted") {
       try {
         new Notification("📞 Inbound Call Completed", {
-          body: `Call from ${callerNumber} ended. Duration: ${formatDuration(durationSec)}. Synced to Pipedrive CRM.`,
+          body: `Call from ${callerNumber} ended. Duration: ${formatDuration(durationSec)}.`,
           icon: "/favicon.ico"
         });
       } catch (e) { /* ignore */ }
