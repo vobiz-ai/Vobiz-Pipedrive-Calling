@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { startServer, startWithVobiz, fakeApi, login, TOKEN1 } = require("./harness");
+const { startServer, startWithVobiz, fakeApi, login, pipedriveStore, ADMIN_TOKEN, TOKEN1 } = require("./harness");
 
 const ROOT = path.join(__dirname, "..", "..");
 const read = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
@@ -32,10 +32,7 @@ async function connectedPipedrive(deals) {
     if (r.url === "/api/v1/callLogs") return { json: { success: true, data: { id: "cl-1" } } };
     return null;
   });
-  const store = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pd-tok-")), "t.json");
-  fs.writeFileSync(store, JSON.stringify({
-    access_token: "at", refresh_token: "rt", expires_at: Date.now() + 3600e3, api_domain: pipedrive.url,
-  }));
+  const store = pipedriveStore({ 1001: { apiDomain: pipedrive.url } });
   return { pipedrive, store };
 }
 
@@ -120,17 +117,35 @@ test("a call is linked to the contact's deal only when it has exactly one open d
   assert.ok(!("deal_id" in bodiesFor(none.pipedrive, "/api/v1/activities")[0]));
 });
 
-test("Disconnect Pipedrive: a signed-in agent's POST forgets the tokens", async (t) => {
-  const { pipedrive, store } = await connectedPipedrive([]);
+test("Disconnect Pipedrive: an agent disconnects only the company linked to its own account", async (t) => {
+  const pipedrive = await fakeApi(() => null);
+  const store = pipedriveStore({
+    1001: { apiDomain: pipedrive.url, vobizAuthIds: ["MA_TEST0001"] },
+    2002: { apiDomain: pipedrive.url },
+  });
   const { srv, stop } = await startWithVobiz({ PIPEDRIVE_TOKEN_STORE: store });
   t.after(async () => { await stop(); await pipedrive.close(); });
-  assert.equal((await (await fetch(`${srv.base}/auth/pipedrive/status`)).json()).connected, true);
-  const { json } = await login(srv.base, "MA_TEST0001", TOKEN1, "asha");
-  const r = await fetch(`${srv.base}/auth/pipedrive/disconnect`, { method: "POST", headers: bearer(json.token) });
+  const one = await login(srv.base, "MA_TEST0001", TOKEN1, "asha");
+  const status = await (await fetch(`${srv.base}/auth/pipedrive/status`, { headers: bearer(one.json.token) })).json();
+  assert.equal(status.companyId, "1001");
+  assert.equal(status.linked, true);
+
+  const r = await fetch(`${srv.base}/auth/pipedrive/disconnect`, { method: "POST", headers: bearer(one.json.token) });
   assert.equal(r.status, 200);
   assert.deepEqual(await r.json(), { ok: true });
+  const left = Object.keys(JSON.parse(fs.readFileSync(store, "utf8")));
+  assert.deepEqual(left, ["2002"], "the other company is untouched");
+
+  // 2002 is now the default company for MA_TEST0001, but it is not linked to
+  // it, so the agent cannot disconnect it. The admin can.
+  const again = await fetch(`${srv.base}/auth/pipedrive/disconnect`, { method: "POST", headers: bearer(one.json.token) });
+  assert.equal(again.status, 403);
+  const admin = await fetch(`${srv.base}/auth/pipedrive/disconnect`, {
+    method: "POST", headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ companyId: "2002" }),
+  });
+  assert.equal(admin.status, 200);
   assert.equal((await (await fetch(`${srv.base}/auth/pipedrive/status`)).json()).connected, false);
-  assert.ok(!fs.existsSync(store));
 });
 
 test("panel: no hard-coded profiles, correct call-flow and logging text, a Disconnect Pipedrive control", () => {
@@ -139,7 +154,7 @@ test("panel: no hard-coded profiles, correct call-flow and logging text, a Disco
   assert.doesNotMatch(html, /<option value="(admin|john|jane)"/);
   assert.doesNotMatch(html, /John Doe|Jane Smith|System Administrator|yourcompany/);
   assert.match(html, /id="loginAgentSelect"[^>]*list="agentProfiles"/, "profile id can be typed or picked");
-  assert.match(js, /fetch\("\/api\/agents"\)/);
+  assert.match(js, /fetch\(api\("api\/agents"\)\)/);
   assert.doesNotMatch(js, /agentSelect\.value : "admin"/);
 
   assert.doesNotMatch(html, /dials the customer first/);
@@ -149,7 +164,7 @@ test("panel: no hard-coded profiles, correct call-flow and logging text, a Disco
 
   assert.match(html, /id="pipedriveDisconnectBtn"/);
   assert.match(js, /window\.confirm\(/);
-  assert.match(js, /fetch\("\/auth\/pipedrive\/disconnect", \{ method: "POST", headers \}\)/);
+  assert.match(js, /fetch\(api\("auth\/pipedrive\/disconnect"\), \{ method: "POST", headers \}\)/);
 });
 
 test("CTI page says the softphone opens in its own tab; PIPEDRIVE_COMPANY_DOMAIN is gone", () => {

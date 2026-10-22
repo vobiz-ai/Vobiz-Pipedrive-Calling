@@ -111,9 +111,15 @@ Pipedrive and uploads the audio to the Call Log.
    Set at least these in `backend/.env`:
 
    ```ini
-   TUNNEL_URL=https://calling.example.com
+   PUBLIC_BASE_URL=https://calling.example.com
    SIGNING_SECRET=<the value you just generated>
+   ADMIN_TOKEN=<another generated value>
+   TOKEN_ENCRYPTION_KEY=<another generated value>
    ```
+
+   If the backend is served under a path (for example
+   `https://integrations.example.com/pipedrive/` behind a proxy that strips
+   `/pipedrive`), include the path in `PUBLIC_BASE_URL`.
 
 3. Start the backend (port `8092` by default):
 
@@ -124,7 +130,7 @@ Pipedrive and uploads the audio to the Call Log.
 4. Expose it on your public HTTPS URL (a reverse proxy, a load balancer, or a
    named tunnel). To try it out without a domain, run `npm run tunnel` in a
    second terminal: it starts a Cloudflare quick tunnel and writes its URL to
-   `backend/tunnel-url.txt`, which the backend uses when `TUNNEL_URL` is empty.
+   `backend/tunnel-url.txt`, which the backend uses when `PUBLIC_BASE_URL` and `TUNNEL_URL` are empty.
    Quick-tunnel hostnames change on every restart, so do not use them for real
    traffic.
 
@@ -176,23 +182,37 @@ Restart the backend.
 
 ### 2. Authorize
 
-Open `https://calling.example.com/auth/pipedrive` in a browser where you are
-signed in to Pipedrive, and approve the app. The page then says **Connected to
+Connecting a company is an admin step. Open
+`https://calling.example.com/admin/login` in a browser where you are signed in
+to Pipedrive, enter `ADMIN_TOKEN` and the Vobiz Auth ID whose calls should be
+logged to this company, and approve the app. The page then says **Connected to
 Pipedrive**. To check at any time:
 
 ```bash
-curl -s https://calling.example.com/auth/pipedrive/status
-# {"configured":true,"connected":true,"scope":"...","apiDomain":"https://yourcompany.pipedrive.com",...}
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" https://calling.example.com/admin/pipedrive/companies
+# {"companies":[{"companyId":"1234567","companyDomain":"yourcompany","vobizAuthIds":["MA_XXXXXXXX"],...}]}
 ```
 
-The backend stores the OAuth tokens in `backend/.pipedrive-tokens.json` and
-refreshes the access token on its own. Do this step right after you deploy:
-until a company is connected, anyone who can reach `/auth/pipedrive` can
-connect one.
+Each Pipedrive company gets its own grant, stored under its company id in
+`DATA_DIR/pipedrive-companies.json` with the access and refresh tokens
+encrypted with `TOKEN_ENCRYPTION_KEY` (AES-256-GCM). The backend refreshes
+access tokens on its own, and every connected company survives a restart.
+Connecting a second company adds it beside the first; it never replaces it.
 
-To connect a different Pipedrive company later, sign in to the softphone with
-your Vobiz account and press **Disconnect Pipedrive**, or stop the backend and
-delete `backend/.pipedrive-tokens.json`. Then authorize again.
+A call is logged to the company linked to its Vobiz account. A company linked
+to no account is the default for accounts no company claims, as long as it is
+the only unlinked one. To link an account later:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"companyId":"1234567","authId":"MA_XXXXXXXX"}' https://calling.example.com/admin/pipedrive/link
+```
+
+To disconnect, an agent signed in with a linked Vobiz account presses
+**Disconnect Pipedrive** in the softphone, or the admin posts
+`{"companyId":"…"}` to `/auth/pipedrive/disconnect`. An older
+`backend/.pipedrive-tokens.json` is moved into the encrypted store, and
+deleted, the first time the backend starts with `TOKEN_ENCRYPTION_KEY` set.
 
 ### 3. Open the softphone
 
@@ -407,8 +427,10 @@ Auth Token, SIP credentials or numbers go here.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `TUNNEL_URL` | Yes | contents of `backend/tunnel-url.txt` | Public HTTPS base URL of the backend, no trailing slash. Applications are pointed at `<this>/answer`, and webhook signatures are checked against it. Set it before anyone signs in |
-| `PUBLIC_BASE_URL` | No | — | Alias for `TUNNEL_URL`, used when `TUNNEL_URL` is empty |
+| `PUBLIC_BASE_URL` | Yes | `TUNNEL_URL` | Public HTTPS base URL of the backend, including any path prefix (e.g. `https://integrations.example.com/pipedrive`). Applications are pointed at `<this>/answer`, webhook signatures are checked against it, and the admin cookie is scoped to its path. Set it before anyone signs in |
+| `TUNNEL_URL` | No | contents of `backend/tunnel-url.txt` | Used when `PUBLIC_BASE_URL` is empty |
+| `ADMIN_TOKEN` | Yes, to connect Pipedrive | — | Secret for the admin routes: connecting, linking, listing and disconnecting Pipedrive companies. Unset, connecting is off |
+| `TOKEN_ENCRYPTION_KEY` | Yes, to connect Pipedrive | — | 32 bytes (64 hex characters or base64) that seal the stored Pipedrive tokens. Keep a copy: without it, every company must be connected again |
 | `PORT` | No | `8092` | Port the backend listens on |
 | `SIGNING_SECRET` | Yes in production | random per start | Key for signing recording links. If unset, every link stops working when the backend restarts |
 | `RECORDING_URL_TTL_SECONDS` | No | `900` | How long a recording link stays valid, in seconds |
@@ -418,8 +440,8 @@ Auth Token, SIP credentials or numbers go here.
 | `VOBIZ_REGISTRAR` | No | `registrar.vobiz.ai` | SIP registrar the softphone registers with (`wss://<this>:5063/`) |
 | `PIPEDRIVE_CLIENT_ID` | Yes | — | Client ID of your Pipedrive app |
 | `PIPEDRIVE_CLIENT_SECRET` | Yes | — | Client secret of your Pipedrive app |
-| `PIPEDRIVE_REDIRECT_URI` | No | `<TUNNEL_URL>/auth/pipedrive/callback` | OAuth callback. Must match the app's Callback URL exactly |
-| `PIPEDRIVE_TOKEN_STORE` | No | `backend/.pipedrive-tokens.json` | Where the Pipedrive OAuth tokens are stored |
+| `PIPEDRIVE_REDIRECT_URI` | No | `<PUBLIC_BASE_URL>/auth/pipedrive/callback` | OAuth callback. Must match the app's Callback URL exactly |
+| `PIPEDRIVE_TOKEN_STORE` | No | `DATA_DIR/pipedrive-companies.json` | Where the encrypted per-company Pipedrive grants are stored |
 | `ALLOWED_ORIGINS` | No | — | Extra browser origins allowed to call the backend, comma separated. `https://*.pipedrive.com` and `localhost` are always allowed |
 | `PIPEDRIVE_ALLOW_API_TOKEN` | No | `0` | Set to `1` to use a personal API token instead of OAuth. OAuth takes priority when connected |
 | `PIPEDRIVE_API_TOKEN` | No | — | Personal API token, used only with `PIPEDRIVE_ALLOW_API_TOKEN=1` |
@@ -438,11 +460,14 @@ Auth Token, SIP credentials or numbers go here.
   and browsers only allow the microphone on HTTPS (or `localhost`).
 - **Run exactly one backend instance.** Sign-ins, sessions and in-progress
   calls are held in memory, so they cannot be shared across instances.
-- **Keep the data on persistent storage:** `DATA_DIR` and the Pipedrive token
-  file (`PIPEDRIVE_TOKEN_STORE`). Both are written with mode `0600`.
+- **Keep the data on persistent storage:** `DATA_DIR`, which holds the
+  encrypted Pipedrive store (`PIPEDRIVE_TOKEN_STORE`). Files are written with
+  mode `0600`. Keep `TOKEN_ENCRYPTION_KEY` and `ADMIN_TOKEN` in a password
+  manager as well as in `.env`.
 - **Set `SIGNING_SECRET`** to a fixed random value, so recording links survive
   restarts.
-- **Set `TUNNEL_URL`** to the production URL before anyone signs in. If you
+- **Set `PUBLIC_BASE_URL`** to the production URL (with its path prefix, if
+  any) before anyone signs in. If you
   change it later, restart and have each account sign in again; that updates
   the `Vobiz-Pipedrive-Calling` application. Update the Pipedrive app's
   Callback URL and `PIPEDRIVE_REDIRECT_URI` yourself.
@@ -450,12 +475,12 @@ Auth Token, SIP credentials or numbers go here.
   `[signature] valid Vobiz signature` in the log, then set
   `VOBIZ_WEBHOOK_SIGNATURES=require` (unless you use SIP direct).
 - **Restrict who can reach the backend** if only your company should use it.
-  Any Vobiz account can sign in, and every account's calls are logged to the
-  one connected Pipedrive company.
+  Any Vobiz account can sign in. Link every account to its Pipedrive company
+  when you connect it, so no account's calls fall through to a default company.
 - **Run it under a process manager** (systemd, PM2, a container) that restarts
   it on failure. After a restart, agents sign in again.
 - **Pipedrive app:** set the production Callback URL in Developer Hub and
-  authorize once with `/auth/pipedrive`.
+  connect each company from `/admin/login`.
 
 ## Security and privacy
 
@@ -463,9 +488,10 @@ Auth Token, SIP credentials or numbers go here.
   browser sends it once at sign-in and gets an opaque session token back. The
   backend keeps the Auth Token in memory only, and never logs it or returns it.
 - **What is stored on disk:** endpoint IDs and SIP usernames in
-  `DATA_DIR/endpoints.json`, and the Pipedrive OAuth tokens in
-  `backend/.pipedrive-tokens.json`. Both are mode `0600`. No SIP passwords and
-  no Vobiz tokens are written to disk.
+  `DATA_DIR/endpoints.json`, and one Pipedrive OAuth grant per company in
+  `DATA_DIR/pipedrive-companies.json`, its tokens encrypted with
+  `TOKEN_ENCRYPTION_KEY`. Both are mode `0600`. No SIP passwords, no Vobiz
+  tokens and no plaintext Pipedrive tokens are written to disk.
 - **What the browser receives:** a session token (valid for 12 hours), the SIP
   username and password for its own endpoint, your account's numbers, and
   signed recording links. SIP direct keeps the SIP password in the browser
@@ -507,23 +533,24 @@ other party.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Sign-in says *Vobiz did not accept that Auth ID and Auth Token* | Wrong credentials, or the console login password was used | Copy both values from Console → **API credentials** |
-| Sign-in says *This server has no public URL (TUNNEL_URL)* | `TUNNEL_URL` is empty | Set `TUNNEL_URL` and restart |
+| Sign-in says *This server has no public URL (TUNNEL_URL)* | `PUBLIC_BASE_URL` and `TUNNEL_URL` are empty | Set `PUBLIC_BASE_URL` and restart |
 | Badge shows *Registration failed* | Account mode: the same agent profile signed in elsewhere, which changed the SIP password. SIP direct: wrong username or password | Sign in again, one person per profile. For SIP direct, use the user part of the endpoint's `sip_uri` |
 | Badge stays on *Connecting…* | The backend is unreachable, or the network blocks `wss://registrar.vobiz.ai:5063` | Check the backend log and the agent's firewall |
 | Outbound call: you hear *This phone is not signed in* | The backend restarted and lost the sign-ins | Sign in again |
 | Outbound call fails at once, `bleg=(none…)` in the log | The destination is unreachable, the caller ID is not on the account, or the balance is too low | Check the number format, the caller ID and the balance |
 | Outbound call: you hear *This Vobiz account has no phone number to call from* | The account has no active, voice-enabled number | Buy or activate a number, then sign in again |
-| Nothing at all reaches the backend (no `[/answer]` in the log) | `TUNNEL_URL` is stale, or the endpoint is not attached to the application (sign-in log says `NOT bound`) | Fix `TUNNEL_URL`, restart and sign in again. For SIP direct, attach the endpoint yourself |
+| Nothing at all reaches the backend (no `[/answer]` in the log) | `PUBLIC_BASE_URL` is stale, or the endpoint is not attached to the application (sign-in log says `NOT bound`) | Fix `PUBLIC_BASE_URL`, restart and sign in again. For SIP direct, attach the endpoint yourself |
 | Inbound calls never ring the softphone | The number is not attached to the integration's application | Select the number and press **Enable inbound calls on this number** |
 | Inbound caller hears *no one is available* | Nobody from the account that owns the number is signed in | Keep at least one agent signed in |
-| Log shows `[signature] INVALID` and Vobiz gets `403` | `TUNNEL_URL` does not match the URL Vobiz is calling | Set `TUNNEL_URL` to the exact public URL, restart, and sign in again |
-| No Activity or Call Log in Pipedrive | Pipedrive is not connected, or the call was not answered | Check `GET /auth/pipedrive/status`. Unanswered calls are not logged |
+| Log shows `[signature] INVALID` and Vobiz gets `403` | `PUBLIC_BASE_URL` does not match the URL Vobiz is calling (check the path prefix) | Set `PUBLIC_BASE_URL` to the exact public URL, restart, and sign in again |
+| No Activity or Call Log in Pipedrive | No Pipedrive company is linked to this Vobiz account, or the call was not answered | Check `GET /admin/pipedrive/companies` (admin). Unanswered calls are not logged |
 | Activity is not linked to a person | No Pipedrive person has that phone number | Add the number to the person in Pipedrive |
 | Listen link says *invalid or has expired* | The link is older than `RECORDING_URL_TTL_SECONDS`, or the backend restarted without a fixed `SIGNING_SECRET` | Play the audio on the Call Log, or from the softphone's recordings list |
 | Listen link says to sign in again | The backend restarted and holds no credentials for that account yet | Sign in to the softphone with that account, then reopen the link |
-| `/auth/pipedrive` says *Already connected* | A Pipedrive company is already connected | Press **Disconnect Pipedrive** in the softphone first (see [Authorize](#2-authorize)) |
+| `/auth/pipedrive` says *Admin sign-in required* | Connecting is an admin step | Sign in at `/admin/login` with `ADMIN_TOKEN` (see [Authorize](#2-authorize)) |
+| `/auth/pipedrive` says *TOKEN_ENCRYPTION_KEY is not set* | No key to seal the grant with | Set `TOKEN_ENCRYPTION_KEY` and restart |
 | Activities are owned by the wrong Pipedrive user | The profile has no `pipedriveUserId`, or a wrong one | Set the agent's Pipedrive user ID in `agents.json` |
-| OAuth callback says *Authorisation rejected* | The approval took longer than 10 minutes, or the backend restarted during it | Start again from `/auth/pipedrive` |
+| OAuth callback says *Authorisation rejected* | The approval took longer than 10 minutes, or the backend restarted during it | Start again from `/admin/login` |
 
 ## Limitations
 

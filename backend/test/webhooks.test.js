@@ -4,7 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const { startServer, startWithVobiz, fakeApi, login, TOKEN1, TOKEN2 } = require("./harness");
+const { startServer, startWithVobiz, fakeApi, login, pipedriveStore, TOKEN1, TOKEN2 } = require("./harness");
 
 const form = (o) => new URLSearchParams(o).toString();
 const FORM = { "Content-Type": "application/x-www-form-urlencoded" };
@@ -180,10 +180,7 @@ test("recording callback writes a correct Activity and Call Log, with an account
     if (r.url === "/api/v1/callLogs") return { json: { success: true, data: { id: "cl-1" } } };
     return null;
   });
-  const store = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pd-tok-")), "t.json");
-  fs.writeFileSync(store, JSON.stringify({
-    access_token: "at", refresh_token: "rt", expires_at: Date.now() + 3600e3, api_domain: pipedrive.url,
-  }));
+  const store = pipedriveStore({ 1001: { apiDomain: pipedrive.url } });
   const { srv, vobiz, stop } = await startWithVobiz({ PIPEDRIVE_TOKEN_STORE: store });
   t.after(async () => { await stop(); await pipedrive.close(); });
   await signedInAgent(srv.base, "MA_TEST0001", TOKEN1);

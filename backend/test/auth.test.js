@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const path = require("path");
 const {
-  startServer, startWithVobiz, login, SECRET_MARKER, TOKEN1, TOKEN2, APP_ID_1, APP_ID_2,
+  startServer, startWithVobiz, login, SECRET_MARKER, ADMIN_TOKEN, TOKEN1, TOKEN2, APP_ID_1, APP_ID_2,
 } = require("./harness");
 
 const bearer = (t) => ({ Authorization: `Bearer ${t}` });
@@ -239,12 +239,29 @@ test("recording proxy takes no caller-supplied URL", async (t) => {
   }
 });
 
-test("Pipedrive cannot be re-pointed at another company while connected", async (t) => {
-  const os = require("os");
-  const store = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pd-tok-")), "t.json");
-  fs.writeFileSync(store, JSON.stringify({ access_token: "a", refresh_token: "r", expires_at: Date.now() + 3600e3 }));
-  const srv = await startServer({ PIPEDRIVE_TOKEN_STORE: store });
+test("connecting Pipedrive requires the admin", async (t) => {
+  const srv = await startServer();
   t.after(srv.stop);
   const r = await fetch(`${srv.base}/auth/pipedrive`, { redirect: "manual" });
-  assert.equal(r.status, 409);
+  assert.equal(r.status, 401);
+  const html = await fetch(`${srv.base}/auth/pipedrive`, { redirect: "manual", headers: { Accept: "text/html" } });
+  assert.equal(html.status, 401);
+  assert.match(await html.text(), /href="\.\.\/admin\/login"/, "relative, so it stays under a path prefix");
+  assert.equal((await fetch(`${srv.base}/admin/pipedrive/companies`)).status, 401);
+  assert.equal((await fetch(`${srv.base}/admin/session`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: "wrong" }),
+  })).status, 401);
+  // A signed-in Vobiz agent is not the admin either.
+  const { json } = await login(srv.base, "MA_TEST0001", TOKEN1).catch(() => ({ json: {} }));
+  if (json.token) assert.equal((await fetch(`${srv.base}/auth/pipedrive`, { redirect: "manual", headers: { Authorization: `Bearer ${json.token}` } })).status, 401);
+
+  const ok = await fetch(`${srv.base}/auth/pipedrive`, { redirect: "manual", headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } });
+  assert.equal(ok.status, 302);
+  assert.match(ok.headers.get("location"), /\/oauth\/authorize\?/);
+});
+
+test("without ADMIN_TOKEN the connect route is off", async (t) => {
+  const srv = await startServer({ ADMIN_TOKEN: "" });
+  t.after(srv.stop);
+  assert.equal((await fetch(`${srv.base}/auth/pipedrive`, { redirect: "manual" })).status, 503);
 });

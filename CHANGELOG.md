@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — serving under a path prefix
+
+- The softphone builds every backend URL from its own location, so it works
+  behind a proxy that serves the backend under a path (e.g. `/pipedrive/`).
+- `PUBLIC_BASE_URL` takes precedence over `TUNNEL_URL` and may include a path
+  prefix; a trailing slash is tolerated.
+
+### Security — Pipedrive tokens: encrypted, per company, admin-only install
+
+- Pipedrive grants are stored per company in `DATA_DIR/pipedrive-companies.json`,
+  with tokens sealed by AES-256-GCM under the new `TOKEN_ENCRYPTION_KEY`. A
+  second company connecting is added beside the first instead of replacing it,
+  and every company survives a restart.
+- Calls are logged to the company linked to their Vobiz account.
+- `/auth/pipedrive` requires the admin (`ADMIN_TOKEN`, via `/admin/login` or a
+  bearer header). New admin routes list companies and link accounts. The admin
+  cookie is scoped to the path of `PUBLIC_BASE_URL`.
+- An existing plaintext `backend/.pipedrive-tokens.json` is moved into the
+  encrypted store and deleted on start-up.
+
 ### Changed — agent profiles, panel text, Pipedrive disconnect
 
 - The Agent Profile picker is filled from `agents.json` via `GET /api/agents`
