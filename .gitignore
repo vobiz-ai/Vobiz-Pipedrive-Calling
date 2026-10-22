@@ -4,6 +4,7 @@ node_modules/
 *.log
 .DS_Store
 .pipedrive-tokens.json
+pipedrive-companies.json
 zoho-orgs.json
 agents.json
 dist/

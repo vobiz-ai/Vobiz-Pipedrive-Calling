@@ -12,6 +12,8 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 const SECRET_MARKER = "SECRETMARKER";
+const TOKEN_KEY = "11".repeat(32);
+const ADMIN_TOKEN = `admin_${SECRET_MARKER}_token`;
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -59,6 +61,9 @@ async function startServer(extraEnv = {}) {
     PIPEDRIVE_CLIENT_ID: "client-id",
     PIPEDRIVE_CLIENT_SECRET: `pd_${SECRET_MARKER}`,
     PIPEDRIVE_TOKEN_STORE: path.join(path.dirname(envFile), "tokens.json"),
+    PIPEDRIVE_LEGACY_TOKEN_FILE: path.join(path.dirname(envFile), "legacy-tokens.json"),
+    TOKEN_ENCRYPTION_KEY: TOKEN_KEY,
+    ADMIN_TOKEN,
     TUNNEL_URL: "https://tunnel.example.test",
     ...extraEnv,
   };
@@ -223,7 +228,22 @@ async function startWithVobiz(extraEnv = {}, opts = {}) {
   return { srv, vobiz, stop: async () => { await srv.stop(); await vobiz.close(); } };
 }
 
+/**
+ * A sealed Pipedrive company store, written the way the server writes it.
+ * `companies` maps company id -> { apiDomain, vobizAuthIds, ... }.
+ */
+function pipedriveStore(companies) {
+  const { createTokenStore } = require("../token-store");
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pd-tok-")), "companies.json");
+  const store = createTokenStore({ file, key: TOKEN_KEY });
+  for (const [id, c] of Object.entries(companies)) {
+    store.put(id, { accessToken: `at-${id}`, refreshToken: `rt-${id}`, expiresAt: Date.now() + 3600e3, vobizAuthIds: [], ...c });
+  }
+  return file;
+}
+
 module.exports = {
+  pipedriveStore, TOKEN_KEY, ADMIN_TOKEN,
   startServer, fakeApi, fakeVobiz, startWithVobiz, rawGet, login,
   SECRET_MARKER, TOKEN1, TOKEN2, APP_ID_1, APP_ID_2, ACCOUNTS,
 };

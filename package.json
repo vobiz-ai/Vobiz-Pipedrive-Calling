@@ -13,7 +13,7 @@
     "test:recording": "node backend/test-pipedrive-sync.js --recording-proxy",
     "test:sync": "node backend/test-pipedrive-sync.js --sync-cdrs",
     "fetch-cdr": "node backend/fetch-cdr.js --sync",
-    "oauth:status": "node -e \"process.loadEnvFile('./backend/.env');fetch(process.env.TUNNEL_URL+'/auth/pipedrive/status').then(r=>r.json()).then(d=>console.log(d))\""
+    "oauth:status": "node -e \"process.loadEnvFile('./backend/.env');fetch((process.env.PUBLIC_BASE_URL||process.env.TUNNEL_URL).replace(/\\/+$/,'')+'/auth/pipedrive/status').then(r=>r.json()).then(d=>console.log(d))\""
   },
   "keywords": [
     "vobiz",

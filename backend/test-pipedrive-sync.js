@@ -92,7 +92,7 @@ async function main() {
 
   if (all || args.includes("--answer")) {
     // What Vobiz fetches when the browser dials. Must be <Dial><Number>.
-    const publicUrl = process.env.TUNNEL_URL || process.env.PUBLIC_BASE_URL;
+    const publicUrl = process.env.PUBLIC_BASE_URL || process.env.TUNNEL_URL;
     if (!publicUrl) {
       skip("public answer URL", "TUNNEL_URL is not set");
     } else if (!sipUser) {

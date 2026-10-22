@@ -16,6 +16,14 @@
 document.addEventListener("DOMContentLoaded", () => {
   "use strict";
 
+  // Every backend URL is built from this page's own location, never from the
+  // host root: behind a proxy that serves this backend under a prefix (e.g.
+  // /pipedrive/), "/api/login" would reach a different backend. The page is
+  // served at <base>/ and at <base>/agent-phone/index.html; both give <base>/.
+  const BASE = location.pathname.replace(/[^/]*$/, "").replace(/agent-phone\/$/, "");
+  const api = (p) => BASE + String(p).replace(/^\/+/, "");
+  const BACKEND_URL = BASE.replace(/\/+$/, ""); // for VobizSip, which appends "/api/…"
+
   // Elements
   const statusBadge = document.getElementById("status");
   const statusMessage = document.getElementById("status-message");
@@ -267,8 +275,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if ("Notification" in window && Notification.permission === "granted") {
       try {
         new Notification("📞 Inbound Call Completed", {
-          body: `Call from ${callerNumber} ended. Duration: ${formatDuration(durationSec)}.`,
-          icon: "/favicon.ico"
+          body: `Call from ${callerNumber} ended. Duration: ${formatDuration(durationSec)}.`
         });
       } catch (e) { /* ignore */ }
     }
@@ -500,7 +507,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (accountLoginBtn) accountLoginBtn.disabled = true;
 
     try {
-      const res = await fetch("/api/login", {
+      const res = await fetch(api("api/login"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ authId, authToken, agentId })
@@ -530,7 +537,7 @@ document.addEventListener("DOMContentLoaded", () => {
         window.VobizSip.connect({
           token: data.token,
           audioElement: remoteAudio,
-          backendUrl: ""
+          backendUrl: BACKEND_URL
         });
 
         loadCallRecordings();
@@ -583,7 +590,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // SIP user, so its webhooks can route this endpoint's calls. The SIP
     // password never leaves the browser.
     try {
-      const res = await fetch("/api/sip-direct", {
+      const res = await fetch(api("api/sip-direct"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sipUser: cleanUsername, callerId }),
@@ -622,11 +629,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function handleLogout() {
     const headers = authHeaders();
-    if (headers.Authorization) fetch("/api/logout", { method: "POST", headers }).catch(() => {});
+    if (headers.Authorization) fetch(api("api/logout"), { method: "POST", headers }).catch(() => {});
     try {
       const claim = JSON.parse(sessionStorage.getItem(SIP_CLAIM_KEY) || "null");
       if (claim && claim.claimToken) {
-        fetch("/api/sip-direct/release", {
+        fetch(api("api/sip-direct/release"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(claim),
@@ -657,7 +664,7 @@ document.addEventListener("DOMContentLoaded", () => {
     try { saved = localStorage.getItem(AGENT_PROFILE_KEY) || ""; } catch { /* storage unavailable */ }
     let profiles = [];
     try {
-      const res = await fetch("/api/agents");
+      const res = await fetch(api("api/agents"));
       const data = await res.json();
       profiles = Array.isArray(data.agents) ? data.agents : [];
     } catch (err) {
@@ -689,13 +696,15 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     try {
-      const res = await fetch("/auth/pipedrive/status");
+      const res = await fetch(api("auth/pipedrive/status"), { headers });
       const data = await res.json();
       pipedriveConnectionRow.classList.toggle("hidden", !data.connected);
+      // Only a company linked to this account can be disconnected from here;
+      // the default company is the admin's to disconnect.
+      if (pipedriveDisconnectBtn) pipedriveDisconnectBtn.classList.toggle("hidden", !data.linked);
       if (pipedriveConnectionStatus && data.connected) {
-        pipedriveConnectionStatus.textContent = data.apiDomain
-          ? `Pipedrive connected (${data.apiDomain.replace(/^https?:\/\//, "")}).`
-          : "Pipedrive connected.";
+        const domain = data.companyDomain || (data.apiDomain || "").replace(/^https?:\/\//, "");
+        pipedriveConnectionStatus.textContent = domain ? `Pipedrive connected (${domain}).` : "Pipedrive connected.";
       }
     } catch {
       pipedriveConnectionRow.classList.add("hidden");
@@ -709,12 +718,12 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     const ok = window.confirm(
-      "Disconnect Pipedrive?\n\nCalls stop being logged to Pipedrive until someone connects it again at /auth/pipedrive. This affects everyone using this backend."
+      "Disconnect Pipedrive?\n\nCalls from this Vobiz account stop being logged to Pipedrive until the admin connects the company again. This affects everyone signed in to this Vobiz account."
     );
     if (!ok) return;
     if (pipedriveDisconnectBtn) pipedriveDisconnectBtn.disabled = true;
     try {
-      const res = await fetch("/auth/pipedrive/disconnect", { method: "POST", headers });
+      const res = await fetch(api("auth/pipedrive/disconnect"), { method: "POST", headers });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.ok) {
         log("Disconnected from Pipedrive.", "info");
@@ -758,7 +767,8 @@ document.addEventListener("DOMContentLoaded", () => {
           updateDialButtonState();
           window.VobizSip.connect({
             token: session.token,
-            audioElement: remoteAudio
+            audioElement: remoteAudio,
+            backendUrl: BACKEND_URL
           });
           loadCallRecordings();
           refreshPipedriveConnection();
@@ -823,7 +833,7 @@ document.addEventListener("DOMContentLoaded", () => {
       updateDialButtonState();
       if (!number || !authHeaders().Authorization) return;
       try {
-        const res = await fetch("/api/caller-id", {
+        const res = await fetch(api("api/caller-id"), {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify({ number }),
@@ -866,7 +876,7 @@ document.addEventListener("DOMContentLoaded", () => {
       enableInboundBtn.disabled = true;
       if (inboundStatus) inboundStatus.textContent = `Enabling inbound calls on ${number}…`;
       try {
-        const res = await fetch("/api/inbound/enable", {
+        const res = await fetch(api("api/inbound/enable"), {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify({ number }),
@@ -1011,7 +1021,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     try {
-      const res = await fetch(`/api/pipedrive/persons/lookup?phone=${encodeURIComponent(phone)}`, { headers: authHeaders() });
+      const res = await fetch(api(`api/pipedrive/persons/lookup?phone=${encodeURIComponent(phone)}`), { headers: authHeaders() });
       if (res.ok) {
         const contact = await res.json();
         if (contact && contact.name) {
@@ -1050,7 +1060,7 @@ document.addEventListener("DOMContentLoaded", () => {
         historyList.innerHTML = `<li class="history-empty">Sign in with your Vobiz account to see recordings.</li>`;
         return;
       }
-      const res = await fetch("/recordings?limit=10", { headers: authHeaders() });
+      const res = await fetch(api("recordings?limit=10"), { headers: authHeaders() });
       const data = await res.json();
       const list = (data && (data.recordings || data.objects)) || [];
 

@@ -26,13 +26,20 @@ try {
 
 const TUNNEL_URL_FILE = path.join(__dirname, "tunnel-url.txt");
 
+/**
+ * The public base URL, path prefix included (e.g.
+ * https://integrations.vobiz.ai/pipedrive behind a proxy that strips
+ * /pipedrive). Every URL handed to Vobiz or Pipedrive is built from it, and
+ * Vobiz signs the full URL, so the prefix matters. PUBLIC_BASE_URL wins; then
+ * TUNNEL_URL; then the file `npm run tunnel` writes.
+ */
 function getPublicBaseUrl() {
-  const configured = process.env.TUNNEL_URL || process.env.PUBLIC_BASE_URL;
-  if (configured && configured.trim()) {
-    return configured.trim();
-  }
+  const configured = [process.env.PUBLIC_BASE_URL, process.env.TUNNEL_URL]
+    .map((v) => String(v || "").trim().replace(/^["']|["']$/g, ""))
+    .find(Boolean);
+  if (configured) return configured.replace(/\/+$/, "");
   try {
-    const urlStr = fs.readFileSync(TUNNEL_URL_FILE, "utf8").trim();
+    const urlStr = fs.readFileSync(TUNNEL_URL_FILE, "utf8").trim().replace(/\/+$/, "");
     return urlStr || null;
   } catch {
     return null;
@@ -168,6 +175,43 @@ const PIPEDRIVE_OAUTH_ENV = {
 
 const VOBIZ_REGISTRAR = cleanEnvVar(process.env.VOBIZ_REGISTRAR) || "registrar.vobiz.ai";
 const DATA_DIR = cleanEnvVar(process.env.DATA_DIR) || path.join(__dirname, "data");
+
+// Pipedrive grants, one per company, sealed with TOKEN_ENCRYPTION_KEY.
+pipedriveOAuth.configure({
+  file: cleanEnvVar(process.env.PIPEDRIVE_TOKEN_STORE) || path.join(DATA_DIR, "pipedrive-companies.json"),
+  key: cleanEnvVar(process.env.TOKEN_ENCRYPTION_KEY) || undefined,
+});
+
+const { createAdminAuth } = require("./admin-auth");
+const adminAuth = createAdminAuth({
+  adminToken: cleanEnvVar(process.env.ADMIN_TOKEN),
+  secret: SIGNING_SECRET,
+  publicBaseUrl: () => getPublicBaseUrl() || "",
+});
+
+/** Gate for admin routes. Writes 503/401 and returns false when not admin. */
+function requireAdmin(req, res) {
+  if (!adminAuth.configured()) {
+    res.writeHead(503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "ADMIN_TOKEN is not set on this backend" }));
+    return false;
+  }
+  if (!adminAuth.isAdmin(req)) {
+    const wantsHtml = /text\/html/.test(String(req.headers.accept || ""));
+    if (wantsHtml) {
+      // Relative, so it stays under the path prefix.
+      res.writeHead(401, { "Content-Type": "text/html; charset=utf-8" });
+      res.end('<h1>Admin sign-in required</h1><p><a href="../admin/login">Sign in as admin</a>, then start again.</p>');
+    } else {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Admin authentication required" }));
+    }
+    return false;
+  }
+  return true;
+}
+
+const AUTH_ID_RE = /^[A-Za-z0-9_]{4,64}$/;
 
 const { createAccountRegistry } = require("./vobiz-accounts");
 const registry = createAccountRegistry({
@@ -501,14 +545,23 @@ let warnedAboutApiToken = false;
  * server still reported "not configured" and skipped every CRM write — the
  * token is exactly what OAuth replaces.
  */
-function pipedriveAvailable() {
-  return pipedriveOAuth.isConnected() ||
-    Boolean(PIPEDRIVE_API_TOKEN && !PIPEDRIVE_API_TOKEN.includes("YOUR_PIPEDRIVE") && PIPEDRIVE_ALLOW_API_TOKEN);
+function legacyApiTokenEnabled() {
+  return Boolean(PIPEDRIVE_API_TOKEN && !PIPEDRIVE_API_TOKEN.includes("YOUR_PIPEDRIVE") && PIPEDRIVE_ALLOW_API_TOKEN);
 }
 
-async function pipedriveRequest(apiPath, options = {}) {
-  if (pipedriveOAuth.isConnected()) {
-    return pipedriveOAuth.pipedriveFetch(PIPEDRIVE_OAUTH_ENV, `/api/v1${apiPath}`, options);
+/** Is Pipedrive reachable for this Vobiz account's calls? */
+function pipedriveAvailable(authId) {
+  return pipedriveOAuth.isConnected(authId) || legacyApiTokenEnabled();
+}
+
+/**
+ * A Pipedrive API request on behalf of a Vobiz account: with the grant of the
+ * company that account is linked to, never another company's.
+ */
+async function pipedriveRequest(authId, apiPath, options = {}) {
+  const companyId = pipedriveOAuth.companyFor(authId);
+  if (companyId) {
+    return pipedriveOAuth.pipedriveFetch(PIPEDRIVE_OAUTH_ENV, companyId, `/api/v1${apiPath}`, options);
   }
 
   if (PIPEDRIVE_API_TOKEN && PIPEDRIVE_ALLOW_API_TOKEN) {
@@ -522,7 +575,7 @@ async function pipedriveRequest(apiPath, options = {}) {
 
   const err = new Error(
     pipedriveOAuth.isConfigured(PIPEDRIVE_OAUTH_ENV)
-      ? "Not connected to Pipedrive. Visit /auth/pipedrive to authorise."
+      ? "This Vobiz account is not linked to a Pipedrive company. An admin connects one at /auth/pipedrive."
       : "Pipedrive is not configured. Set the OAuth client credentials, or PIPEDRIVE_ALLOW_API_TOKEN=1 to use a personal token."
   );
   err.notConfigured = true;
@@ -533,10 +586,10 @@ async function pipedriveRequest(apiPath, options = {}) {
  * The person's open deal, when there is exactly one. With none or several
  * there is no way to tell which deal the call is about, so it is not linked.
  */
-async function openDealFor(personId) {
+async function openDealFor(personId, authId) {
   if (!personId) return { deal_id: null };
   try {
-    const res = await pipedriveRequest(`/persons/${encodeURIComponent(personId)}/deals?status=open&limit=2`);
+    const res = await pipedriveRequest(authId, `/persons/${encodeURIComponent(personId)}/deals?status=open&limit=2`);
     const json = await res.json().catch(() => ({}));
     const deals = res.ok && json.success && Array.isArray(json.data) ? json.data : [];
     if (deals.length === 1 && deals[0] && deals[0].id) {
@@ -548,8 +601,8 @@ async function openDealFor(personId) {
   return { deal_id: null };
 }
 
-async function getPipedrivePersonByPhone(phoneNumber) {
-  if (!pipedriveAvailable()) {
+async function getPipedrivePersonByPhone(phoneNumber, authId) {
+  if (!pipedriveAvailable(authId)) {
     // Mock data is opt-in. It used to be the silent fallback whenever the token
     // was missing, so the whole test suite passed green against a CRM it had
     // never contacted.
@@ -571,7 +624,7 @@ async function getPipedrivePersonByPhone(phoneNumber) {
   try {
     const cleanPhone = (phoneNumber || "").replace(/[^0-9+]/g, "");
     const searchUrl = `/persons/find?term=${encodeURIComponent(cleanPhone)}&search_by_phone=1`;
-    const res = await pipedriveRequest(searchUrl);
+    const res = await pipedriveRequest(authId, searchUrl);
     const json = await res.json();
     
     if (json.success && Array.isArray(json.data) && json.data.length > 0) {
@@ -582,13 +635,13 @@ async function getPipedrivePersonByPhone(phoneNumber) {
         email: match.email,
         phone: match.phone,
         organization: match.org_name || null,
-        ...(await openDealFor(match.id))
+        ...(await openDealFor(match.id, authId))
       };
     }
 
     // Try itemSearch if find didn't return matches
     const itemSearchUrl = `/itemSearch?term=${encodeURIComponent(cleanPhone)}&item_types=person&fields=phone`;
-    const searchRes = await pipedriveRequest(itemSearchUrl);
+    const searchRes = await pipedriveRequest(authId, itemSearchUrl);
     const searchJson = await searchRes.json();
     if (searchJson.success && searchJson.data?.items?.length > 0) {
       const item = searchJson.data.items[0].item;
@@ -598,7 +651,7 @@ async function getPipedrivePersonByPhone(phoneNumber) {
         email: item.emails?.[0] || null,
         phone: item.phones?.[0] || null,
         organization: item.organization?.name || null,
-        ...(await openDealFor(item.id))
+        ...(await openDealFor(item.id, authId))
       };
     }
   } catch (err) {
@@ -613,7 +666,7 @@ async function getPipedrivePersonByPhone(phoneNumber) {
 }
 
 async function createPipedriveActivity(callInfo) {
-  if (!pipedriveAvailable()) {
+  if (!pipedriveAvailable(callInfo.authId)) {
     if (!ALLOW_MOCK) {
       console.error("[Pipedrive] No API token configured and ALLOW_MOCK is not set — activity NOT created.");
       return { mocked: false, success: false, pipedriveConfigured: false, error: "Pipedrive is not configured on this server" };
@@ -673,7 +726,7 @@ ${proxyRecordingUrl ? `<p><b>Recording:</b> <a href="${e(proxyRecordingUrl)}" ta
       user_id: callInfo.pipedriveUserId || undefined
     };
 
-    const res = await pipedriveRequest("/activities", {
+    const res = await pipedriveRequest(callInfo.authId, "/activities", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -739,7 +792,7 @@ async function uploadCallLogRecording(callLogId, authId, recordingId) {
     const ext = /wav/i.test(media.contentType) ? "wav" : "mp3";
     const form = new FormData();
     form.append("file", new Blob([media.buffer], { type: media.contentType }), `${recordingId}.${ext}`);
-    const res = await pipedriveRequest(`/callLogs/${encodeURIComponent(callLogId)}/recordings`, { method: "POST", body: form });
+    const res = await pipedriveRequest(authId, `/callLogs/${encodeURIComponent(callLogId)}/recordings`, { method: "POST", body: form });
     const json = await res.json().catch(() => ({}));
     if (!res.ok || !json.success) {
       console.warn(`[Pipedrive] recording upload failed: HTTP ${res.status}`, json.error || "");
@@ -754,7 +807,7 @@ async function uploadCallLogRecording(callLogId, authId, recordingId) {
 }
 
 async function createPipedriveCallLog(callInfo) {
-  if (!pipedriveAvailable()) {
+  if (!pipedriveAvailable(callInfo.authId)) {
     return { success: false, pipedriveConfigured: false, error: "Pipedrive is not configured on this server" };
   }
 
@@ -769,7 +822,7 @@ async function createPipedriveCallLog(callInfo) {
       return { success: false, error: "No destination number for this call; call log not written" };
     }
 
-    const res = await pipedriveRequest("/callLogs", {
+    const res = await pipedriveRequest(callInfo.authId, "/callLogs", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -821,7 +874,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       status: "ok",
       service: "vobiz-pipedrive-integration",
-      pipedriveConnected: pipedriveAvailable(),
+      pipedriveConnected: pipedriveOAuth.anyConnected() || legacyApiTokenEnabled(),
       publicUrlConfigured: Boolean(getPublicBaseUrl()),
     }));
     return;
@@ -836,10 +889,91 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Admin ─────────────────────────────────────────────────────────────────
+  // Whoever holds ADMIN_TOKEN. The sign-in form posts to a relative URL, so
+  // it works unchanged under a path prefix.
+  if (pathname === "/admin/login" && req.method === "GET") {
+    const authId = AUTH_ID_RE.test(String(parsedUrl.query.authId || "")) ? String(parsedUrl.query.authId) : "";
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(`<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin sign-in</title>
+<style>:root{color-scheme:light dark}body{font:15px/1.6 system-ui,sans-serif;max-width:480px;margin:0 auto;padding:32px 16px}
+input,button{font-size:15px;padding:10px;width:100%;box-sizing:border-box;margin-top:8px}</style>
+<h1>Admin sign-in</h1>
+<p>Sign in to connect a Pipedrive company to this backend.</p>
+<form method="POST" action="session">
+<input name="token" type="password" placeholder="ADMIN_TOKEN" autocomplete="off" autofocus>
+<input name="authId" placeholder="Vobiz Auth ID to link (optional), e.g. MA_XXXXXXXX" value="${escapeXmlAttr(authId)}">
+<button>Sign in and connect Pipedrive</button>
+</form>`);
+    return;
+  }
+
+  if (pathname === "/admin/session" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    if (!adminAuth.configured()) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "ADMIN_TOKEN is not set on this backend" }));
+      return;
+    }
+    if (!adminAuth.verifyToken(body.token)) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Wrong admin token" }));
+      return;
+    }
+    const authId = AUTH_ID_RE.test(String(body.authId || "").trim()) ? String(body.authId).trim() : "";
+    // Relative to /admin/session, so /pipedrive/admin/session -> /pipedrive/auth/pipedrive.
+    const next = `../auth/pipedrive${authId ? `?authId=${encodeURIComponent(authId)}` : ""}`;
+    const isForm = /application\/x-www-form-urlencoded/.test(String(req.headers["content-type"] || ""));
+    if (isForm) {
+      res.writeHead(303, { Location: next, "Set-Cookie": adminAuth.cookie(req) });
+      res.end();
+    } else {
+      res.writeHead(200, { "Content-Type": "application/json", "Set-Cookie": adminAuth.cookie(req) });
+      res.end(JSON.stringify({ ok: true, next }));
+    }
+    return;
+  }
+
+  if (pathname === "/admin/logout" && req.method === "POST") {
+    res.writeHead(200, { "Content-Type": "application/json", "Set-Cookie": adminAuth.clearCookie() });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  // Connected companies and the Vobiz accounts each one serves. No tokens.
+  if (pathname === "/admin/pipedrive/companies" && req.method === "GET") {
+    if (!requireAdmin(req, res)) return;
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ companies: pipedriveOAuth.listCompanies() }));
+    return;
+  }
+
+  // Link a Vobiz account to a connected company (and off any other one).
+  if (pathname === "/admin/pipedrive/link" && req.method === "POST") {
+    if (!requireAdmin(req, res)) return;
+    const body = await readJsonBody(req).catch(() => ({}));
+    const authId = String(body.authId || "").trim();
+    if (!AUTH_ID_RE.test(authId) || !pipedriveOAuth.link(String(body.companyId || ""), authId)) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Need a connected companyId and a Vobiz authId" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, company: pipedriveOAuth.listCompanies().find((c) => c.companyId === String(body.companyId)) }));
+    return;
+  }
+
   // ── Pipedrive OAuth 2.0 ───────────────────────────────────────────────────
   // Required for Marketplace listing: Pipedrive mandates OAuth 2.0 and forbids
   // collecting or storing API tokens.
+  //
+  // Admin only. Each connect is stored under the company Pipedrive reports for
+  // the grant, so connecting a second company adds it beside the first rather
+  // than replacing it. ?authId= links that Vobiz account to the company.
   if (pathname === "/auth/pipedrive" && req.method === "GET") {
+    if (!requireAdmin(req, res)) return;
     if (!pipedriveOAuth.isConfigured(PIPEDRIVE_OAUTH_ENV)) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -847,21 +981,27 @@ const server = http.createServer(async (req, res) => {
       }));
       return;
     }
-    // Once connected, re-authorising needs a signed-in agent to disconnect
-    // first. Otherwise anyone who can reach this URL could swap in their own
-    // Pipedrive company and receive this account's call logs.
-    if (pipedriveOAuth.isConnected()) {
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Already connected to Pipedrive. Sign in to the softphone and disconnect first to connect a different company." }));
+    if (!cleanEnvVar(process.env.TOKEN_ENCRYPTION_KEY)) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "TOKEN_ENCRYPTION_KEY is not set, so a Pipedrive grant cannot be stored. Generate 32 random bytes (64 hex characters)." }));
       return;
     }
-    const target = pipedriveOAuth.buildAuthorizeUrl(PIPEDRIVE_OAUTH_ENV);
-    console.log("[oauth] redirecting to Pipedrive consent screen");
+    const authId = String(parsedUrl.query.authId || "").trim();
+    if (authId && !AUTH_ID_RE.test(authId)) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "authId does not look like a Vobiz Auth ID" }));
+      return;
+    }
+    const target = pipedriveOAuth.buildAuthorizeUrl(PIPEDRIVE_OAUTH_ENV, { authId });
+    console.log(`[oauth] redirecting to Pipedrive consent screen${authId ? ` (to link ${authId})` : ""}`);
     res.writeHead(302, { Location: target });
     res.end();
     return;
   }
 
+  // Pipedrive redirects the browser here. No admin check: the `state` was
+  // minted for an admin a moment ago and is single-use, and on a host where
+  // the callback is registered at the root the admin cookie is not sent.
   if (pathname === "/auth/pipedrive/callback" && req.method === "GET") {
     const { code, state, error } = parsedUrl.query;
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -873,7 +1013,8 @@ const server = http.createServer(async (req, res) => {
     }
     // An unrecognised or stale `state` means this callback did not originate
     // from a flow we started.
-    if (!pipedriveOAuth.consumeState(state)) {
+    const pending = pipedriveOAuth.consumeState(state);
+    if (!pending) {
       console.error("[oauth] callback with unknown or expired state — rejected");
       res.writeHead(400);
       res.end("<h1>Authorisation rejected</h1><p>This callback did not match a sign-in this server started. Start again from /auth/pipedrive.</p>");
@@ -885,10 +1026,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     try {
-      await pipedriveOAuth.exchangeCode(PIPEDRIVE_OAUTH_ENV, code);
-      console.log("[oauth] connected to Pipedrive");
+      const company = await pipedriveOAuth.exchangeCode(PIPEDRIVE_OAUTH_ENV, code, { authId: pending.authId });
+      console.log(`[oauth] connected Pipedrive company ${company.companyId}${pending.authId ? ` for ${pending.authId}` : ""}`);
       res.writeHead(200);
-      res.end("<h1>Connected to Pipedrive</h1><p>You can close this tab and return to the softphone.</p>");
+      res.end(`<h1>Connected to Pipedrive</h1><p>Company ${escapeXmlText(company.companyDomain || company.companyId)}${
+        pending.authId ? `, linked to Vobiz account ${escapeXmlText(pending.authId)}` : ""
+      }. You can close this tab and return to the softphone.</p>`);
     } catch (err) {
       console.error("[oauth] token exchange failed:", err.message);
       res.writeHead(502);
@@ -897,22 +1040,46 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // With a session: the company this account's calls are logged to. Without
+  // one: booleans only.
   if (pathname === "/auth/pipedrive/status" && req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      configured: pipedriveOAuth.isConfigured(PIPEDRIVE_OAUTH_ENV),
-      ...pipedriveOAuth.status(),
-    }));
+    const s = getSession(req);
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(s
+      ? { configured: pipedriveOAuth.isConfigured(PIPEDRIVE_OAUTH_ENV), ...pipedriveOAuth.status(s.authId) }
+      : { configured: pipedriveOAuth.isConfigured(PIPEDRIVE_OAUTH_ENV), connected: pipedriveOAuth.anyConnected() }));
     return;
   }
 
+  // Disconnect a company. The admin names any company; a signed-in agent can
+  // disconnect only the company explicitly linked to its own Vobiz account,
+  // never the default one other accounts may be using.
   if (pathname === "/auth/pipedrive/disconnect" && req.method === "POST") {
-    if (!getSession(req)) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Sign in first" }));
+    const body = await readJsonBody(req).catch(() => ({}));
+    let companyId = null;
+    if (adminAuth.isAdmin(req)) {
+      companyId = String(body.companyId || "");
+    } else {
+      const s = getSession(req);
+      if (!s) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Sign in first" }));
+        return;
+      }
+      const mine = pipedriveOAuth.companyFor(s.authId);
+      if (!mine || !pipedriveOAuth.isLinked(mine, s.authId)) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "No Pipedrive company is linked to this Vobiz account. Ask the admin to disconnect it." }));
+        return;
+      }
+      companyId = mine;
+    }
+    if (!pipedriveOAuth.disconnect(companyId)) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "No such company" }));
       return;
     }
-    pipedriveOAuth.disconnect();
+    console.log(`[oauth] disconnected Pipedrive company ${companyId}`);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     return;
@@ -1366,7 +1533,7 @@ const server = http.createServer(async (req, res) => {
         const outbound = fromNumber.startsWith("sip:") ||
           Boolean(owner && owner.numbers.includes(registry.normalizeE164(fromNumber)));
         const target = outbound ? toNumber : fromNumber;
-        const personMatch = target ? await getPipedrivePersonByPhone(target) : {};
+        const personMatch = target ? await getPipedrivePersonByPhone(target, owner ? owner.authId : "") : {};
         callInfo = {
           callUuid,
           authId: owner ? owner.authId : "",
@@ -1380,7 +1547,7 @@ const server = http.createServer(async (req, res) => {
           dealId: personMatch.deal_id
         };
       } else if (!callInfo.personId && callInfo.targetNumber) {
-        const personMatch = await getPipedrivePersonByPhone(callInfo.targetNumber);
+        const personMatch = await getPipedrivePersonByPhone(callInfo.targetNumber, callInfo.authId);
         callInfo.personId = personMatch.person_id;
         callInfo.personName = personMatch.name;
         callInfo.dealId = personMatch.deal_id;
@@ -1545,7 +1712,8 @@ const server = http.createServer(async (req, res) => {
 
   // 7. Pipedrive Contact Lookup Endpoint (for Softphone UI)
   if (pathname === "/api/pipedrive/persons/lookup") {
-    if (!requireSession(req, res)) return;
+    const session = requireSession(req, res);
+    if (!session) return;
     try {
       const phone = parsedUrl.query.phone;
       if (!phone) {
@@ -1553,7 +1721,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "Missing 'phone' parameter" }));
         return;
       }
-      const match = await getPipedrivePersonByPhone(phone);
+      const match = await getPipedrivePersonByPhone(phone, session.authId);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(match));
     } catch (err) {
@@ -1591,7 +1759,7 @@ const server = http.createServer(async (req, res) => {
       let notConfigured = false;
       for (const cdr of cdrs) {
         const targetNumber = cdr.call_direction === "inbound" ? cdr.caller_id_number : cdr.destination_number;
-        const personMatch = await getPipedrivePersonByPhone(targetNumber);
+        const personMatch = await getPipedrivePersonByPhone(targetNumber, account.authId);
 
         const callInfo = {
           callUuid: cdr.uuid,
